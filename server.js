@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
+const pool = require('./db');
+const authRoutes = require('./auth');
 require('dotenv').config();
 
 const app = express();
@@ -8,16 +10,9 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
+app.use('/api/v1/auth', authRoutes);
 
-// --- POSTGRESQL CONNECTION ---
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT,
-});
-
+// Test Pool Connection
 pool.connect((err, client, release) => {
   if (err) {
     console.error('[LMCO Engine] Database connection error:', err.stack);
@@ -27,13 +22,50 @@ pool.connect((err, client, release) => {
   }
 });
 
+// ==========================================
+// AUTHENTICATION & RBAC MIDDLEWARE
+// ==========================================
+
+// 1. Verify JWT Token Middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Access token required.' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'lmco_super_secret_jwt_key_2026', (err, user) => {
+    if (err) {
+      return res.status(403).json({ success: false, message: 'Invalid or expired token.' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// 2. Role-Based Access Control (RBAC) Guard
+const authorizeRoles = (...allowedRoles) => {
+  return (req, res, next) => {
+    const formattedAllowedRoles = allowedRoles.map(r => r.toUpperCase());
+    
+    if (!req.user || !formattedAllowedRoles.includes(req.user.role.toUpperCase())) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied: Insufficient permissions for this route.' 
+      });
+    }
+    next();
+  };
+};
+
 // --- HEALTH CHECK ROUTE ---
 app.get('/', (req, res) => {
   res.json({ message: 'LMCO Backend Engine active.' });
 });
 
 // ==========================================
-// WEEK 1 ROUTES: SESSIONS & ORDERS
+// WEEK 1: SESSIONS & ORDERS
 // ==========================================
 
 // 1. Resolve QR Token
@@ -122,10 +154,10 @@ app.post('/api/orders', validateSession, (req, res) => {
 });
 
 // ==========================================
-// WEEK 2 ROUTES: MENU MANAGEMENT CRUD
+// WEEK 2: MENU & CATEGORY ENGINE
 // ==========================================
 
-// 1. READ ALL MENU ITEMS
+// 1. READ ALL MENU ITEMS (Public Access)
 app.get('/api/v1/menu', async (req, res) => {
   try {
     const query = `
@@ -148,8 +180,8 @@ app.get('/api/v1/menu', async (req, res) => {
   }
 });
 
-// 2. CREATE NEW MENU ITEM
-app.post('/api/v1/menu', async (req, res) => {
+// 2. CREATE NEW MENU ITEM (Admin Only)
+app.post('/api/v1/menu', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { category_id, name, price } = req.body;
 
   if (!name || !price) {
@@ -170,8 +202,8 @@ app.post('/api/v1/menu', async (req, res) => {
   }
 });
 
-// 3. UPDATE MENU ITEM
-app.put('/api/v1/menu/:id', async (req, res) => {
+// 3. UPDATE MENU ITEM (Admin Only)
+app.put('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { id } = req.params;
   const { category_id, name, price, is_available } = req.body;
 
@@ -195,8 +227,36 @@ app.put('/api/v1/menu/:id', async (req, res) => {
   }
 });
 
-// 4. DELETE MENU ITEM
-app.delete('/api/v1/menu/:id', async (req, res) => {
+// 4. TOGGLE ITEM AVAILABILITY (Admin & Kitchen Staff)
+app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN'), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const query = `
+      UPDATE menu_items 
+      SET is_available = NOT is_available 
+      WHERE id = $1 
+      RETURNING *
+    `;
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Menu item not found.' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Item availability changed to ${result.rows[0].is_available}`,
+      item: result.rows[0]
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to toggle availability.' });
+  }
+});
+
+// 5. DELETE MENU ITEM (Admin Only)
+app.delete('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -210,6 +270,88 @@ app.delete('/api/v1/menu/:id', async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: 'Failed to delete menu item.' });
+  }
+});
+
+// 6. GET ALL CATEGORIES (Public Access)
+app.get('/api/v1/categories', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM categories ORDER BY id ASC');
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to fetch categories.' });
+  }
+});
+
+app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN'), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const query = `
+      UPDATE menu_items 
+      SET is_available = NOT is_available 
+      WHERE id = $1 
+      RETURNING *
+    `;
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Menu item not found.' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Item availability changed to ${result.rows[0].is_available}`,
+      item: result.rows[0]
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to toggle availability.' });
+  }
+});
+
+// ==========================================
+// NEW ROUTE (Add this directly below!)
+// ==========================================
+app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN', 'WAITER'), async (req, res) => {
+  const { table_id } = req.body;
+
+  if (!table_id) {
+    return res.status(400).json({ success: false, message: 'table_id is required.' });
+  }
+
+  try {
+    const tableRes = await pool.query('SELECT * FROM tables WHERE id = $1', [table_id]);
+    if (tableRes.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Table not found.' });
+    }
+
+    const table = tableRes.rows[0];
+    const jwtSecret = process.env.JWT_SECRET || 'lmco_super_secret_jwt_key_2026';
+    
+    // Sign JWT for table identity verification
+    const signedQrToken = jwt.sign(
+      { table_id: table.id, table_number: table.table_number },
+      jwtSecret
+    );
+
+    await pool.query('UPDATE tables SET qr_token = $1 WHERE id = $2', [signedQrToken, table.id]);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        table_id: table.id,
+        table_number: table.table_number,
+        qr_token: signedQrToken,
+        qr_url: `http://localhost:5000/api/session/scan/${signedQrToken}`
+      },
+      message: `Signed QR code successfully generated for ${table.table_number}`
+    });
+
+  } catch (err) {
+    console.error('❌ [LMCO QR Generator Error]:', err);
+    return res.status(500).json({ success: false, message: 'Failed to generate QR token.' });
   }
 });
 
