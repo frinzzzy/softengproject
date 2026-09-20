@@ -369,7 +369,6 @@ const processOrderPayment = async (req, res) => {
             [id]
         );
 
-        // SAFEGUARD: I-check muna kung may session_id para hindi mag-hang ang query kung null/undefined
         if (order.session_id) {
             await client.query(
                 `UPDATE table_sessions 
@@ -411,7 +410,6 @@ const processOrderPayment = async (req, res) => {
 // 5. GET DAILY SALES REPORT (From Payments Ledger)
 const getDailySalesReport = async (req, res) => {
     try {
-        // FIX 9: Aggregate from `payments` ledger table for audit accuracy
         const query = `
             SELECT 
                 COUNT(id) AS total_transactions,
@@ -442,10 +440,164 @@ const getDailySalesReport = async (req, res) => {
     }
 };
 
+// 6. CANCEL ORDER (Customer or Staff with Queue Check)
+const cancelOrder = async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const checkQuery = 'SELECT id, order_status FROM orders WHERE id = $1';
+        const checkResult = await pool.query(checkQuery, [id]);
+
+        if (checkResult.rows.length === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Order not found.' 
+            });
+        }
+
+        const currentStatus = checkResult.rows[0].order_status;
+
+        if (currentStatus !== 'PENDING') {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot cancel order. Current status is '${currentStatus}'. Only PENDING orders can be cancelled directly. Please approach a waiter for assistance.`
+            });
+        }
+
+        const updateQuery = `
+            UPDATE orders 
+            SET order_status = 'CANCELLED' 
+            WHERE id = $1 
+            RETURNING id, table_id, order_status, total_amount, created_at;
+        `;
+        const { rows } = await pool.query(updateQuery, [id]);
+
+        return res.status(200).json({
+            success: true,
+            message: `Order #${id} has been successfully cancelled.`,
+            data: rows[0]
+        });
+
+    } catch (error) {
+        console.error('Cancel order error:', error.message);
+        return res.status(500).json({ 
+            success: false, 
+            message: error.message || 'Internal server error.' 
+        });
+    }
+};
+
+// 7. CANCEL ACTIVE TABLE SESSION (Customer/Staff Session Cancellation)
+const cancelTableSession = async (req, res) => {
+    const { session_id } = req.params;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const sessionResult = await client.query(
+            "SELECT * FROM table_sessions WHERE id = $1 AND session_status = 'ACTIVE'",
+            [session_id]
+        );
+
+        if (sessionResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'Active session not found or already closed.' });
+        }
+
+        const updateResult = await client.query(
+            "UPDATE table_sessions SET session_status = 'CANCELLED', closed_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *",
+            [session_id]
+        );
+
+        await client.query('COMMIT');
+
+        return res.status(200).json({
+            success: true,
+            message: `Table session #${session_id} has been successfully cancelled.`,
+            data: updateResult.rows[0]
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Cancel table session error:', error.message);
+        return res.status(500).json({ success: false, error: 'Failed to cancel table session.' });
+    } finally {
+        client.release();
+    }
+};
+
+// 8. REQUEST BILL BREAKDOWN (Formal bill preview prior to cashier settlement)
+const requestBill = async (req, res) => {
+    const { session_id } = req.params;
+
+    try {
+        const sessionRes = await pool.query(
+            `SELECT ts.id AS session_id, ts.table_id, t.table_number, ts.session_status 
+             FROM table_sessions ts 
+             JOIN tables t ON ts.table_id = t.id 
+             WHERE ts.id = $1 AND ts.session_status = 'ACTIVE'`,
+            [session_id]
+        );
+
+        if (sessionRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'Active table session not found.' });
+        }
+
+        const session = sessionRes.rows[0];
+
+        const ordersRes = await pool.query(
+            `SELECT id, total_amount, order_status, created_at 
+             FROM orders 
+             WHERE session_id = $1 AND order_status != 'CANCELLED'`,
+            [session_id]
+        );
+
+        let grossTotal = 0;
+        const orders = ordersRes.rows;
+
+        for (const order of orders) {
+            grossTotal += parseFloat(order.total_amount);
+        }
+
+        const orderIds = orders.map(o => o.id);
+        let items = [];
+        if (orderIds.length > 0) {
+            const itemsRes = await pool.query(
+                `SELECT oi.id, oi.order_id, m.name, oi.quantity, oi.unit_price, (oi.quantity * oi.unit_price) AS subtotal
+                 FROM order_items oi
+                 JOIN menu_items m ON oi.menu_item_id = m.id
+                 WHERE oi.order_id = ANY($1::int[])`,
+                [orderIds]
+            );
+            items = itemsRes.rows;
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: 'Bill breakdown generated successfully.',
+            data: {
+                session_id: session.session_id,
+                table_number: session.table_number,
+                orders: orders,
+                items: items,
+                gross_total: parseFloat(grossTotal.toFixed(2))
+            }
+        });
+
+    } catch (error) {
+        console.error('Request bill error:', error.message);
+        return res.status(500).json({ success: false, message: error.message || 'Internal server error.' });
+    }
+};
+
 module.exports = {
     createOrder,
     getOrders,
     updateOrderStatus,
     processOrderPayment,
-    getDailySalesReport
+    getDailySalesReport,
+    cancelOrder,
+    cancelTableSession,
+    requestBill
 };

@@ -11,7 +11,10 @@ const {
   getOrders, 
   updateOrderStatus, 
   processOrderPayment, 
-  getDailySalesReport 
+  getDailySalesReport,
+  cancelOrder,
+  cancelTableSession,
+  requestBill
 } = require('./orders');
 
 const app = express();
@@ -248,6 +251,9 @@ app.put('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (r
   }
 });
 
+app.put('/api/v1/orders/:id/cancel', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), cancelOrder);
+app.put('/api/v1/sessions/:session_id/cancel', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), cancelTableSession);
+
 app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN'), async (req, res) => {
   try {
     const { id } = req.params;
@@ -303,6 +309,8 @@ app.get('/api/v1/categories', async (req, res) => {
   }
 });
 
+app.get('/api/v1/sessions/:session_id/bill', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), requestBill);
+
 app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN', 'WAITER'), async (req, res) => {
   const { table_id } = req.body;
 
@@ -344,12 +352,11 @@ app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN'
 });
 
 // ==========================================
-// STAFF WORKSTATION QR AUTH & GENERATION (ADDED HERE)
+// STAFF WORKSTATION QR AUTH & GENERATION
 // ==========================================
 
-// 1. Generate workstation QR token (Admin side)
 app.post('/api/v1/workstations/generate', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
-  const { station_type } = req.body; // 'kitchen', 'waiter', 'admin'
+  const { station_type } = req.body; 
   
   if (!['kitchen', 'waiter', 'admin'].includes(station_type)) {
     return res.status(400).json({ success: false, message: 'Invalid station type. Must be kitchen, waiter, or admin.' });
@@ -373,7 +380,6 @@ app.post('/api/v1/workstations/generate', authenticateToken, authorizeRoles('ADM
   }
 });
 
-// 2. Authenticate via workstation QR scan (Staff mobile app side)
 app.post('/api/v1/auth/workstation-scan', async (req, res) => {
   const { qr_token } = req.body;
 
