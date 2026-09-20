@@ -1,9 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto'); // <--- NILAGAY SA LINE 3 (Pinagsamang crypto module)
 const pool = require('./db');
 const authRoutes = require('./auth');
-require('dotenv').config();
+const assistanceRoutes = require('./assistance');
+
+const { 
+  createOrder, 
+  getOrders, 
+  updateOrderStatus, 
+  processOrderPayment, 
+  getDailySalesReport 
+} = require('./orders');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -11,6 +20,7 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/assistance', assistanceRoutes);
 
 // Test Pool Connection
 pool.connect((err, client, release) => {
@@ -26,7 +36,6 @@ pool.connect((err, client, release) => {
 // AUTHENTICATION & RBAC MIDDLEWARE
 // ==========================================
 
-// 1. Verify JWT Token Middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -44,7 +53,6 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// 2. Role-Based Access Control (RBAC) Guard
 const authorizeRoles = (...allowedRoles) => {
   return (req, res, next) => {
     const formattedAllowedRoles = allowedRoles.map(r => r.toUpperCase());
@@ -59,16 +67,15 @@ const authorizeRoles = (...allowedRoles) => {
   };
 };
 
-// --- HEALTH CHECK ROUTE ---
+// HEALTH CHECK ROUTE
 app.get('/', (req, res) => {
   res.json({ message: 'LMCO Backend Engine active.' });
 });
 
 // ==========================================
-// WEEK 1: SESSIONS & ORDERS
+// SESSIONS & ORDERS
 // ==========================================
 
-// 1. Resolve QR Token
 app.get('/api/session/scan/:qr_token', async (req, res) => {
   const { qr_token } = req.params;
 
@@ -85,28 +92,28 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
     const foundTable = tableResult.rows[0];
 
     const sessionResult = await pool.query(
-      'SELECT * FROM table_sessions WHERE table_id = $1 AND is_active = TRUE',
+      "SELECT * FROM table_sessions WHERE table_id = $1 AND session_status = 'ACTIVE'",
       [foundTable.id]
     );
 
-    let sessionToken;
+    let session;
 
     if (sessionResult.rows.length > 0) {
-      sessionToken = sessionResult.rows[0].session_token;
+      session = sessionResult.rows[0];
     } else {
-      sessionToken = `sess_tbl_${foundTable.id}_${Date.now()}`;
-      await pool.query(
-        'INSERT INTO table_sessions (table_id, session_token) VALUES ($1, $2)',
-        [foundTable.id, sessionToken]
+      const newSessionResult = await pool.query(
+        "INSERT INTO table_sessions (table_id, session_status) VALUES ($1, 'ACTIVE') RETURNING *",
+        [foundTable.id]
       );
+      session = newSessionResult.rows[0];
     }
 
     return res.status(200).json({
       success: true,
       table_id: foundTable.id,
       table_number: foundTable.table_number,
-      session_token: sessionToken,
-      message: `Table session established for ${foundTable.table_number}`
+      session_id: session.id,
+      message: `Table session established for Table ${foundTable.table_number}`
     });
   } catch (error) {
     console.error(error);
@@ -114,18 +121,17 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
   }
 });
 
-// 2. Validate Session Middleware
 const validateSession = async (req, res, next) => {
-  const { session_token, table_id } = req.body;
+  const { session_id, table_id } = req.body;
 
-  if (!session_token || !table_id) {
-    return res.status(400).json({ error: 'Missing session token or table ID.' });
+  if (!session_id || !table_id) {
+    return res.status(400).json({ error: 'Missing session ID or table ID.' });
   }
 
   try {
     const sessionResult = await pool.query(
-      'SELECT * FROM table_sessions WHERE table_id = $1 AND session_token = $2 AND is_active = TRUE',
-      [Number(table_id), session_token]
+      "SELECT * FROM table_sessions WHERE id = $1 AND table_id = $2 AND session_status = 'ACTIVE'",
+      [Number(session_id), Number(table_id)]
     );
 
     if (sessionResult.rows.length === 0) {
@@ -139,70 +145,85 @@ const validateSession = async (req, res, next) => {
   }
 };
 
-// 3. Submit Order
-app.post('/api/orders', validateSession, (req, res) => {
-  const { table_id, items } = req.body;
-
-  return res.status(201).json({
-    success: true,
-    order_id: Math.floor(1000 + Math.random() * 9000),
-    table_id: Number(table_id),
-    status: 'PENDING',
-    items: items || [],
-    message: 'Order placed under verified table session.'
-  });
-});
-
 // ==========================================
-// WEEK 2: MENU & CATEGORY ENGINE
+// v1 PRODUCTION ORDER ENDPOINTS
 // ==========================================
 
-// 1. READ ALL MENU ITEMS (Public Access)
+app.post('/api/v1/orders', createOrder);
+app.get('/api/v1/orders', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'), getOrders);
+app.patch('/api/v1/orders/:id/status', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN'), updateOrderStatus);
+app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'CASHIER', 'WAITER'), processOrderPayment);
+app.get('/api/v1/reports/daily-sales', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), getDailySalesReport);
+
+// ==========================================
+// MENU & CATEGORY ENGINE
+// ==========================================
+
 app.get('/api/v1/menu', async (req, res) => {
   try {
-    const query = `
+    const { category_id, search } = req.query;
+
+    let query = `
       SELECT 
         m.id, 
         m.name, 
         m.price, 
-        m.is_available, 
+        m.is_available,
         m.category_id,
-        c.name AS category_name
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', a.id,
+              'name', a.name,
+              'price', a.price
+            )
+          ) FILTER (WHERE a.id IS NOT NULL), '[]'
+        ) AS addons
       FROM menu_items m
-      LEFT JOIN categories c ON m.category_id = c.id
-      ORDER BY m.id ASC
+      LEFT JOIN menu_addons a ON m.id = a.menu_item_id
     `;
-    const result = await pool.query(query);
-    return res.status(200).json({ success: true, data: result.rows });
+
+    const conditions = [];
+    const values = [];
+
+    if (category_id) {
+      values.push(category_id);
+      conditions.push(`m.category_id = $${values.length}`);
+    }
+
+    if (search) {
+      values.push(`%${search}%`);
+      conditions.push(`m.name ILIKE $${values.length}`);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ` + conditions.join(' AND ');
+    }
+
+    query += ` GROUP BY m.id ORDER BY m.id ASC;`;
+
+    const { rows } = await pool.query(query, values);
+    return res.status(200).json({ success: true, count: rows.length, data: rows });
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: 'Failed to fetch menu items.' });
+    console.error('Error fetching menu:', error);
+    return res.status(500).json({ success: false, error: 'Failed to fetch menu items.', details: error.message });
   }
 });
 
-// 2. CREATE NEW MENU ITEM (Admin Only)
 app.post('/api/v1/menu', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
-  const { category_id, name, price } = req.body;
-
-  if (!name || !price) {
-    return res.status(400).json({ error: 'Item name and price are required.' });
-  }
-
+  const { category_id, name, price, is_available } = req.body;
   try {
-    const query = `
-      INSERT INTO menu_items (category_id, name, price)
-      VALUES ($1, $2, $3)
-      RETURNING *
-    `;
-    const result = await pool.query(query, [category_id || null, name, price]);
-    return res.status(201).json({ success: true, item: result.rows[0] });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: 'Failed to create menu item.' });
+    const result = await pool.query(
+      'INSERT INTO menu_items (category_id, name, price, is_available) VALUES ($1, $2, $3, $4) RETURNING *',
+      [category_id || null, name, price, is_available ?? true]
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create menu item.' });
   }
 });
 
-// 3. UPDATE MENU ITEM (Admin Only)
 app.put('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { id } = req.params;
   const { category_id, name, price, is_available } = req.body;
@@ -214,7 +235,7 @@ app.put('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (r
       WHERE id = $5
       RETURNING *
     `;
-    const result = await pool.query(query, [category_id || null, name, price, is_available, id]);
+    const result = await pool.query(query, [category_id, name, price, is_available, id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Menu item not found.' });
@@ -227,35 +248,34 @@ app.put('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (r
   }
 });
 
-// 4. TOGGLE ITEM AVAILABILITY (Admin & Kitchen Staff)
 app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN'), async (req, res) => {
-  const { id } = req.params;
-
   try {
+    const { id } = req.params;
+
     const query = `
       UPDATE menu_items 
       SET is_available = NOT is_available 
       WHERE id = $1 
-      RETURNING *
+      RETURNING id, name, is_available;
     `;
-    const result = await pool.query(query, [id]);
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Menu item not found.' });
+    const { rows } = await pool.query(query, [id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Menu item not found.' });
     }
 
     return res.status(200).json({
       success: true,
-      message: `Item availability changed to ${result.rows[0].is_available}`,
-      item: result.rows[0]
+      message: `Stock status updated for ${rows[0].name}.`,
+      data: rows[0]
     });
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: 'Failed to toggle availability.' });
+    console.error('Toggle stock error:', error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// 5. DELETE MENU ITEM (Admin Only)
 app.delete('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { id } = req.params;
 
@@ -273,10 +293,9 @@ app.delete('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async
   }
 });
 
-// 6. GET ALL CATEGORIES (Public Access)
 app.get('/api/v1/categories', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM categories ORDER BY id ASC');
+    const result = await pool.query('SELECT * FROM menu_categories ORDER BY id ASC');
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     console.error(error);
@@ -284,36 +303,6 @@ app.get('/api/v1/categories', async (req, res) => {
   }
 });
 
-app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN'), async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const query = `
-      UPDATE menu_items 
-      SET is_available = NOT is_available 
-      WHERE id = $1 
-      RETURNING *
-    `;
-    const result = await pool.query(query, [id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Menu item not found.' });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: `Item availability changed to ${result.rows[0].is_available}`,
-      item: result.rows[0]
-    });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: 'Failed to toggle availability.' });
-  }
-});
-
-// ==========================================
-// NEW ROUTE (Add this directly below!)
-// ==========================================
 app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN', 'WAITER'), async (req, res) => {
   const { table_id } = req.body;
 
@@ -330,7 +319,6 @@ app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN'
     const table = tableRes.rows[0];
     const jwtSecret = process.env.JWT_SECRET || 'lmco_super_secret_jwt_key_2026';
     
-    // Sign JWT for table identity verification
     const signedQrToken = jwt.sign(
       { table_id: table.id, table_number: table.table_number },
       jwtSecret
@@ -352,6 +340,71 @@ app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN'
   } catch (err) {
     console.error('❌ [LMCO QR Generator Error]:', err);
     return res.status(500).json({ success: false, message: 'Failed to generate QR token.' });
+  }
+});
+
+// ==========================================
+// STAFF WORKSTATION QR AUTH & GENERATION (ADDED HERE)
+// ==========================================
+
+// 1. Generate workstation QR token (Admin side)
+app.post('/api/v1/workstations/generate', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
+  const { station_type } = req.body; // 'kitchen', 'waiter', 'admin'
+  
+  if (!['kitchen', 'waiter', 'admin'].includes(station_type)) {
+    return res.status(400).json({ success: false, message: 'Invalid station type. Must be kitchen, waiter, or admin.' });
+  }
+
+  const qrToken = crypto.randomBytes(32).toString('hex');
+
+  try {
+    const query = `
+      INSERT INTO workstations (station_type, qr_token) 
+      VALUES ($1, $2)
+      ON CONFLICT (station_type) 
+      DO UPDATE SET qr_token = $2 
+      RETURNING *;
+    `;
+    const result = await pool.query(query, [station_type, qrToken]);
+    return res.status(200).json({ success: true, workstation: result.rows[0], message: `Workstation QR generated for ${station_type}` });
+  } catch (err) {
+    console.error('❌ [LMCO Workstation Gen Error]:', err);
+    return res.status(500).json({ success: false, message: 'Failed to generate workstation QR token.', details: err.message });
+  }
+});
+
+// 2. Authenticate via workstation QR scan (Staff mobile app side)
+app.post('/api/v1/auth/workstation-scan', async (req, res) => {
+  const { qr_token } = req.body;
+
+  if (!qr_token) {
+    return res.status(400).json({ success: false, message: 'qr_token is required.' });
+  }
+
+  try {
+    const result = await pool.query('SELECT * FROM workstations WHERE qr_token = $1', [qr_token]);
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, message: 'Invalid workstation QR code.' });
+    }
+
+    const station = result.rows[0];
+
+    const token = jwt.sign(
+      { station_type: station.station_type, role: station.station_type.toUpperCase() }, 
+      process.env.JWT_SECRET || 'lmco_super_secret_jwt_key_2026', 
+      { expiresIn: '12h' }
+    );
+
+    return res.status(200).json({ 
+      success: true, 
+      message: `Successfully logged into ${station.station_type} station`,
+      token,
+      station_type: station.station_type
+    });
+  } catch (err) {
+    console.error('❌ [LMCO Workstation Scan Error]:', err);
+    return res.status(500).json({ success: false, message: 'Server error processing workstation scan.', details: err.message });
   }
 });
 

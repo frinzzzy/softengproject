@@ -3,6 +3,7 @@
 -- ==========================================
 
 -- Reset database structure
+DROP TABLE IF EXISTS menu_item_addons CASCADE;
 DROP TABLE IF EXISTS order_items CASCADE;
 DROP TABLE IF EXISTS orders CASCADE;
 DROP TABLE IF EXISTS table_sessions CASCADE;
@@ -43,7 +44,16 @@ CREATE TABLE menu_items (
     is_available BOOLEAN DEFAULT TRUE
 );
 
--- 5. Active Table Sessions (QR Code Scanning)
+-- 5. Menu Item Addons
+CREATE TABLE menu_item_addons (
+    id SERIAL PRIMARY KEY,
+    menu_item_id INT REFERENCES menu_items(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    price DECIMAL(10, 2) NOT NULL,
+    is_available BOOLEAN DEFAULT TRUE
+);
+
+-- 6. Active Table Sessions (QR Code Scanning)
 CREATE TABLE table_sessions (
     id SERIAL PRIMARY KEY,
     table_id INT REFERENCES tables(id) ON DELETE CASCADE,
@@ -52,7 +62,7 @@ CREATE TABLE table_sessions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- 6. Orders Master Table (With Idempotency Key)
+-- 7. Orders Master Table (With Idempotency Key)
 CREATE TABLE orders (
     id SERIAL PRIMARY KEY,
     table_id INT REFERENCES tables(id) ON DELETE CASCADE,
@@ -62,8 +72,7 @@ CREATE TABLE orders (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- 7. Order Items Detail Table
--- 7. Order Items Detail Table
+-- 8. Order Items Detail Table
 CREATE TABLE order_items (
     id SERIAL PRIMARY KEY,
     order_id INT REFERENCES orders(id) ON DELETE CASCADE,
