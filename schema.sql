@@ -1,4 +1,3 @@
--- 1. EXTENSIONS
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- 2. USERS & AUTHENTICATION (RBAC)
@@ -8,6 +7,12 @@ CREATE TABLE users (
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(20) NOT NULL CHECK (role IN ('ADMIN', 'CASHIER', 'KITCHEN', 'WAITER')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE  workstations (
+    id SERIAL PRIMARY KEY,
+    station_type VARCHAR(50) UNIQUE NOT NULL, -- admin, kitchen, waiter
+    qr_token TEXT NOT NULL
 );
 
 -- 3. TABLES & VENUE
