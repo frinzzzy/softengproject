@@ -17,6 +17,13 @@ const {
   requestBill
 } = require('./orders');
 
+// 👉 IDINAGDAG: Import ng Reservation controllers
+const {
+  createReservation,
+  getReservations,
+  checkInReservation
+} = require('./reservations');
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -159,6 +166,14 @@ app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'C
 app.get('/api/v1/reports/daily-sales', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), getDailySalesReport);
 
 // ==========================================
+// RESERVATIONS & SAME-DAY QUEUE ENDPOINTS (IDINAGDAG)
+// ==========================================
+
+app.post('/api/v1/reservations', createReservation);
+app.get('/api/v1/reservations', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), getReservations);
+app.patch('/api/v1/reservations/:id/check-in', authenticateToken, authorizeRoles('ADMIN', 'WAITER'), checkInReservation);
+
+// ==========================================
 // MENU & CATEGORY ENGINE
 // ==========================================
 
@@ -181,7 +196,7 @@ app.get('/api/v1/menu', async (req, res) => {
               'price', a.price
             )
           ) FILTER (WHERE a.id IS NOT NULL), '[]'
-        ) AS addons
+      ) AS addons
       FROM menu_items m
       LEFT JOIN menu_addons a ON m.id = a.menu_item_id
     `;
