@@ -1,10 +1,20 @@
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const crypto = require('crypto'); // <--- NILAGAY SA LINE 3 (Pinagsamang crypto module)
+const crypto = require('crypto');
 const pool = require('./db');
 const authRoutes = require('./auth');
 const assistanceRoutes = require('./assistance');
+
+// 👉 IDINAGDAG: Kasama na sina updateEventReservation at cancelEventReservation
+const { 
+  createEventReservation, 
+  getEventReservations, 
+  updateEventReservation, 
+  cancelEventReservation 
+} = require('./eventReservation');
 
 const { 
   createOrder, 
@@ -17,7 +27,6 @@ const {
   requestBill
 } = require('./orders');
 
-// 👉 IDINAGDAG: Import ng Reservation controllers
 const {
   createReservation,
   getReservations,
@@ -25,6 +34,17 @@ const {
 } = require('./reservations');
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"]
+  }
+});
+
+// Make io accessible globally or export if needed
+app.set('io', io);
+
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
@@ -40,6 +60,23 @@ pool.connect((err, client, release) => {
     console.log('[LMCO Engine] Connected to PostgreSQL Database.');
     release();
   }
+});
+
+// ==========================================
+// SOCKET.IO CONNECTION LISTENER
+// ==========================================
+
+io.on('connection', (socket) => {
+  console.log(`⚡ [Socket.io] User connected: ${socket.id}`);
+
+  socket.on('join_room', (roomName) => {
+    socket.join(roomName);
+    console.log(`User joined room: ${roomName}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`🔌 [Socket.io] User disconnected: ${socket.id}`);
+  });
 });
 
 // ==========================================
@@ -166,12 +203,25 @@ app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'C
 app.get('/api/v1/reports/daily-sales', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), getDailySalesReport);
 
 // ==========================================
-// RESERVATIONS & SAME-DAY QUEUE ENDPOINTS (IDINAGDAG)
+// RESERVATIONS & SAME-DAY QUEUE ENDPOINTS
 // ==========================================
 
 app.post('/api/v1/reservations', createReservation);
 app.get('/api/v1/reservations', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), getReservations);
 app.patch('/api/v1/reservations/:id/check-in', authenticateToken, authorizeRoles('ADMIN', 'WAITER'), checkInReservation);
+
+// ==========================================
+// EVENT RESERVATIONS (FUTURE DATES)
+// ==========================================
+
+app.post('/api/v1/event-reservations', createEventReservation);
+app.get('/api/v1/event-reservations', getEventReservations);
+
+// ==========================================
+// EVENT RESERVATIONS AUTHENTICATION & RBAC
+// ==========================================
+app.put('/api/v1/event-reservations/:id', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), updateEventReservation);         
+app.patch('/api/v1/event-reservations/:id/cancel', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), cancelEventReservation);
 
 // ==========================================
 // MENU & CATEGORY ENGINE
@@ -196,7 +246,7 @@ app.get('/api/v1/menu', async (req, res) => {
               'price', a.price
             )
           ) FILTER (WHERE a.id IS NOT NULL), '[]'
-      ) AS addons
+        ) AS addons
       FROM menu_items m
       LEFT JOIN menu_addons a ON m.id = a.menu_item_id
     `;
@@ -384,7 +434,7 @@ app.post('/api/v1/workstations/generate', authenticateToken, authorizeRoles('ADM
       INSERT INTO workstations (station_type, qr_token) 
       VALUES ($1, $2)
       ON CONFLICT (station_type) 
-      DO UPDATE SET qr_token = $2 
+      UPDATE SET qr_token = $2 
       RETURNING *;
     `;
     const result = await pool.query(query, [station_type, qrToken]);
@@ -429,6 +479,7 @@ app.post('/api/v1/auth/workstation-scan', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+// Gamitin ang server.listen sa halip na app.listen para gumana ang Socket.io
+server.listen(PORT, () => {
   console.log(`[LMCO Backend] Server running on http://localhost:${PORT}`);
 });
