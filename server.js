@@ -8,7 +8,10 @@ const pool = require('./db');
 const authRoutes = require('./auth');
 const assistanceRoutes = require('./assistance');
 
-// 👉 IDINAGDAG: Kasama na sina updateEventReservation at cancelEventReservation
+// 👉 IDINAGDAG: Auto-close worker para sa 5-minutong AFK sessions
+const { startAutoCloseMonitor } = require('./autoclose');
+
+// Kasama na sina updateEventReservation at cancelEventReservation
 const { 
   createEventReservation, 
   getEventReservations, 
@@ -79,6 +82,9 @@ io.on('connection', (socket) => {
   });
 });
 
+// Simulan ang AFK Auto-Close Background Worker
+startAutoCloseMonitor(io);
+
 // ==========================================
 // AUTHENTICATION & RBAC MIDDLEWARE
 // ==========================================
@@ -147,9 +153,14 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
 
     if (sessionResult.rows.length > 0) {
       session = sessionResult.rows[0];
+      // I-update ang last_active_at para ma-reset ang AFK timer kapag nag-scan ulit
+      await pool.query(
+        "UPDATE table_sessions SET last_active_at = CURRENT_TIMESTAMP WHERE id = $1",
+        [session.id]
+      );
     } else {
       const newSessionResult = await pool.query(
-        "INSERT INTO table_sessions (table_id, session_status) VALUES ($1, 'ACTIVE') RETURNING *",
+        "INSERT INTO table_sessions (table_id, session_status, last_active_at) VALUES ($1, 'ACTIVE', CURRENT_TIMESTAMP) RETURNING *",
         [foundTable.id]
       );
       session = newSessionResult.rows[0];
@@ -184,6 +195,12 @@ const validateSession = async (req, res, next) => {
     if (sessionResult.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid or expired table session.' });
     }
+
+    // I-update din ang last_active_at tuwing may bagong aktibidad/order sa session na ito
+    await pool.query(
+      "UPDATE table_sessions SET last_active_at = CURRENT_TIMESTAMP WHERE id = $1",
+      [Number(session_id)]
+    );
 
     next();
   } catch (error) {
