@@ -15,7 +15,9 @@ const generateAccessToken = (user) => {
     );
 };
 
+// ==========================================
 // 1. REGISTER USER
+// ==========================================
 router.post('/register', async (req, res) => {
     const { username, password, role } = req.body;
 
@@ -27,7 +29,9 @@ router.post('/register', async (req, res) => {
     }
 
     try {
-        const userCheck = await pool.query('SELECT id FROM users WHERE username = $1', [username.toLowerCase()]);
+        const cleanUsername = username.trim().toLowerCase();
+
+        const userCheck = await pool.query('SELECT id FROM users WHERE LOWER(username) = $1', [cleanUsername]);
         if (userCheck.rows.length > 0) {
             return res.status(400).json({ success: false, message: 'Username already taken.' });
         }
@@ -38,7 +42,7 @@ router.post('/register', async (req, res) => {
 
         const newUser = await pool.query(
             'INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING id, username, role',
-            [username.toLowerCase(), password_hash, userRole]
+            [cleanUsername, password_hash, userRole]
         );
 
         const createdUser = newUser.rows[0];
@@ -46,7 +50,7 @@ router.post('/register', async (req, res) => {
 
         return res.status(201).json({
             success: true,
-            token, // Exposed at top-level for convenience
+            token,
             data: {
                 token,
                 user: createdUser
@@ -59,7 +63,9 @@ router.post('/register', async (req, res) => {
     }
 });
 
+// ==========================================
 // 2. LOGIN USER
+// ==========================================
 router.post('/login', async (req, res) => {
     const { username, password } = req.body;
 
@@ -71,7 +77,10 @@ router.post('/login', async (req, res) => {
     }
 
     try {
-        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username.toLowerCase()]);
+        const cleanUsername = username.trim().toLowerCase();
+
+        // Match case-insensitively using LOWER()
+        const result = await pool.query('SELECT * FROM users WHERE LOWER(username) = $1', [cleanUsername]);
         
         if (result.rows.length === 0) {
             return res.status(401).json({
@@ -82,6 +91,7 @@ router.post('/login', async (req, res) => {
 
         const user = result.rows[0];
 
+        // Compare bcrypt hash
         const isMatch = await bcrypt.compare(password, user.password_hash);
         if (!isMatch) {
             return res.status(401).json({
@@ -94,7 +104,7 @@ router.post('/login', async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            token, // Top-level token accessor
+            token,
             data: {
                 token,
                 user: {
@@ -115,7 +125,9 @@ router.post('/login', async (req, res) => {
     }
 });
 
-// 3. VERIFY TOKEN HANDSHAKE
+// ==========================================
+// 3. VERIFY TOKEN HANDSHAKE (/me)
+// ==========================================
 router.get('/me', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -139,7 +151,4 @@ router.get('/me', async (req, res) => {
     }
 });
 
-
-
 module.exports = router;
-
