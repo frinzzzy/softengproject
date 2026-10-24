@@ -1,26 +1,25 @@
 const { Pool } = require('pg');
-require('dotenv').config();
 
+// Gamitin ang process.env.DATABASE_URL nang direkta mula sa Render environment variables
 const pool = new Pool({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'postgres',
-    password: String(process.env.DB_PASSWORD || ''),
-    database: process.env.DB_NAME,
-    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 5432,
-    connectionTimeoutMillis: 3000 // Magpapatalo/Mag-e-error agad pagkalipas ng 3 segundo kung walang koneksyon
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false // Kailangan para sa Supabase / cloud PostgreSQL connection
+    },
+    connectionTimeoutMillis: 10000
 });
 
-// Para mahuli kung biglang nawala ang koneksyon sa database
+// Para mahuli kung may error sa connection
 pool.on('error', (err) => {
     console.error('❌ Unexpected database error on idle client:', err.message);
 });
 
-// Optional: I-test ang koneksyon habang nagbubukas ang app
+// I-test ang koneksyon habang nagbubukas ang app
 pool.query('SELECT NOW()', (err, res) => {
     if (err) {
-        console.error('❌ Database Connection Failed! I-check ang `.env` o PostgreSQL service mo:', err.message);
+        console.error('❌ Database Connection Failed! I-check ang DATABASE_URL sa Render environment variables:', err.message);
     } else {
-        console.log('✅ Connected to PostgreSQL Database successfully!');
+        console.log('✅ Connected to Supabase PostgreSQL Database successfully!');
     }
 });
 
