@@ -1292,13 +1292,19 @@ const getDailySalesReport = async (req, res) => {
     try {
         const { period = 'today', start_date, end_date } = req.query;
         let dateCondition = "created_at::date = CURRENT_DATE";
+        let groupBy = "TO_CHAR(created_at, 'YYYY-MM-DD')";
         let queryParams = [];
 
         if (period === 'monthly') {
             dateCondition = "DATE_TRUNC('month', created_at) = DATE_TRUNC('month', CURRENT_DATE)";
+            groupBy = "TO_CHAR(created_at, 'YYYY-MM-DD')";
+        } else if (period === 'yearly') {
+            dateCondition = "DATE_TRUNC('year', created_at) = DATE_TRUNC('year', CURRENT_DATE)";
+            groupBy = "TO_CHAR(created_at, 'YYYY-MM')";
         } else if (period === 'custom' && start_date && end_date) {
             dateCondition = "created_at::date BETWEEN $1 AND $2";
             queryParams = [start_date, end_date];
+            groupBy = "TO_CHAR(created_at, 'YYYY-MM-DD')";
         }
 
         const query = `
@@ -1314,15 +1320,14 @@ const getDailySalesReport = async (req, res) => {
 
         const { rows } = await pool.query(query, queryParams);
 
-        // Opsyonal: Query para makuha ang breakdown ng sales bawat araw/buwan para sa Sales Overview Graph
         let graphQuery = `
             SELECT 
-                TO_CHAR(created_at, 'YYYY-MM-DD') AS label,
+                ${groupBy} AS label,
                 COALESCE(SUM(amount_due), 0) AS total_sales
             FROM payments
             WHERE status = 'COMPLETED' 
               AND ${dateCondition}
-            GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD')
+            GROUP BY ${groupBy}
             ORDER BY label ASC;
         `;
         const graphRes = await pool.query(graphQuery, queryParams);
@@ -1331,21 +1336,17 @@ const getDailySalesReport = async (req, res) => {
             success: true,
             data: {
                 period: period,
-                date: new Date().toISOString().split('T')[0],
                 total_transactions: parseInt(rows[0].total_transactions, 10),
                 gross_sales: parseFloat(rows[0].gross_sales),
                 cash_sales: parseFloat(rows[0].cash_sales),
                 gcash_sales: parseFloat(rows[0].gcash_sales),
                 chart_breakdown: graphRes.rows
             },
-            message: 'Sales analytics report generated successfully.'
+            message: 'Sales analytics generated successfully.'
         });
     } catch (error) {
         console.error('Sales report error:', error.message);
-        return res.status(500).json({
-            success: false,
-            message: error.message || 'Internal server error.'
-        });
+        return res.status(500).json({ success: false, message: error.message });
     }
 };
 
