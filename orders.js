@@ -403,7 +403,7 @@ const getOrderById = async (req, res) => {
         }
 
         const cleanIdStr = rawId.toString().replace('#BS-', '').trim();
-        const numericId = parseInt(cleanIdStr, 10); // <--- TAMA NA ANG JAVASCRIPT PARSEINT
+        const numericId = parseInt(cleanIdStr, 10);
         const validNumericId = !isNaN(numericId) ? numericId : 0;
 
         let query = `
@@ -1290,6 +1290,17 @@ const processOrderPayment = async (req, res) => {
 
 const getDailySalesReport = async (req, res) => {
     try {
+        const { period = 'today', start_date, end_date } = req.query;
+        let dateCondition = "created_at::date = CURRENT_DATE";
+        let queryParams = [];
+
+        if (period === 'monthly') {
+            dateCondition = "DATE_TRUNC('month', created_at) = DATE_TRUNC('month', CURRENT_DATE)";
+        } else if (period === 'custom' && start_date && end_date) {
+            dateCondition = "created_at::date BETWEEN $1 AND $2";
+            queryParams = [start_date, end_date];
+        }
+
         const query = `
             SELECT 
                 COUNT(id) AS total_transactions,
@@ -1298,24 +1309,39 @@ const getDailySalesReport = async (req, res) => {
                 COALESCE(SUM(CASE WHEN payment_method = 'GCASH' THEN amount_due ELSE 0 END), 0) AS gcash_sales
             FROM payments
             WHERE status = 'COMPLETED' 
-              AND created_at::date = CURRENT_DATE;
+              AND ${dateCondition};
         `;
 
-        const { rows } = await pool.query(query);
+        const { rows } = await pool.query(query, queryParams);
+
+        // Opsyonal: Query para makuha ang breakdown ng sales bawat araw/buwan para sa Sales Overview Graph
+        let graphQuery = `
+            SELECT 
+                TO_CHAR(created_at, 'YYYY-MM-DD') AS label,
+                COALESCE(SUM(amount_due), 0) AS total_sales
+            FROM payments
+            WHERE status = 'COMPLETED' 
+              AND ${dateCondition}
+            GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD')
+            ORDER BY label ASC;
+        `;
+        const graphRes = await pool.query(graphQuery, queryParams);
 
         return res.status(200).json({
             success: true,
             data: {
+                period: period,
                 date: new Date().toISOString().split('T')[0],
                 total_transactions: parseInt(rows[0].total_transactions, 10),
                 gross_sales: parseFloat(rows[0].gross_sales),
                 cash_sales: parseFloat(rows[0].cash_sales),
-                gcash_sales: parseFloat(rows[0].gcash_sales)
+                gcash_sales: parseFloat(rows[0].gcash_sales),
+                chart_breakdown: graphRes.rows
             },
-            message: 'Daily sales summary generated successfully.'
+            message: 'Sales analytics report generated successfully.'
         });
     } catch (error) {
-        console.error('Daily sales report error:', error.message);
+        console.error('Sales report error:', error.message);
         return res.status(500).json({
             success: false,
             message: error.message || 'Internal server error.'
