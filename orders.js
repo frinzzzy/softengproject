@@ -1330,7 +1330,15 @@ const getDailySalesReport = async (req, res) => {
             GROUP BY ${groupBy}
             ORDER BY label ASC;
         `;
-        const graphRes = await pool.query(graphQuery, queryParams);
+        let graphRes = await pool.query(graphQuery, queryParams);
+
+        // Safe fallback para lumitaw ang bar sa chart kung may gross sales naman pero walang saktong match sa group label
+        if (graphRes.rows.length === 0 && parseFloat(rows[0].gross_sales) > 0) {
+            graphRes.rows = [{
+                label: start_date || new Date().toISOString().split('T')[0],
+                total_sales: parseFloat(rows[0].gross_sales)
+            }];
+        }
 
         return res.status(200).json({
             success: true,
