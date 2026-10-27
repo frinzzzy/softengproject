@@ -218,7 +218,7 @@ const createOrder = async (req, res) => {
 
         for (const item of items) {
             const menuRes = await client.query(
-                'SELECT id, name, price, is_available FROM menu_items WHERE id = $1::int',
+                'SELECT id, name, price, is_available, stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
                 [Number(item.menu_item_id)]
             );
 
@@ -231,8 +231,14 @@ const createOrder = async (req, res) => {
                 throw Object.assign(new Error(`Menu item #${item.menu_item_id} is unavailable.`), { statusCode: 400 });
             }
 
-            const unitPrice = parseFloat(menuItem.price);
             const qty = Number(item.quantity);
+            const currentStock = menuItem.stock_quantity ?? 50;
+
+            if (currentStock < qty) {
+                throw Object.assign(new Error(`Insufficient stock for ${menuItem.name}. Only ${currentStock} left.`), { statusCode: 400 });
+            }
+
+            const unitPrice = parseFloat(menuItem.price);
             const unitPriceCents = Math.round(unitPrice * 100);
             additionalTotalCents += unitPriceCents * qty;
 
@@ -267,6 +273,7 @@ const createOrder = async (req, res) => {
                 name: menuItem.name,
                 quantity: qty,
                 unit_price: unitPrice,
+                current_stock: currentStock,
                 addons: verifiedAddons
             });
         }
@@ -333,6 +340,22 @@ const createOrder = async (req, res) => {
                     [orderItem.rows[0].id, addon.addon_id, addon.price]
                 );
             }
+
+            const newStock = vItem.current_stock - vItem.quantity;
+            const makeUnavailable = newStock <= 0 ? false : true;
+
+            await client.query(
+                `UPDATE menu_items 
+                 SET stock_quantity = $1::int, is_available = $2::boolean 
+                 WHERE id = $3::int`,
+                [newStock, makeUnavailable, vItem.menu_item_id]
+            );
+
+            await client.query(
+                `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
+                 VALUES ($1::int, $2::int, $3::int, 'ORDER_DEDUCTION', $4)`,
+                [vItem.menu_item_id, vItem.current_stock, newStock, `Deducted for Order #${targetOrder.id}`]
+            );
         }
 
         if (isAdditional) {
@@ -1630,6 +1653,67 @@ const requestBill = async (req, res) => {
     }
 };
 
+const updateItemStock = async (req, res) => {
+    const { id } = req.params;
+    const { stock_quantity, adjustment_type = 'MANUAL_ADJUSTMENT', notes } = req.body;
+    const userId = req.user?.id || null;
+
+    if (stock_quantity === undefined || isNaN(Number(stock_quantity)) || Number(stock_quantity) < 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid non-negative stock_quantity is required.'
+        });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const itemRes = await client.query(
+            'SELECT id, name, stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
+            [id]
+        );
+
+        if (itemRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'Menu item not found.' });
+        }
+
+        const currentItem = itemRes.rows[0];
+        const previousQuantity = currentItem.stock_quantity ?? 50;
+        const newQuantity = Number(stock_quantity);
+        const isAvailable = newQuantity > 0;
+
+        const updateRes = await client.query(
+            `UPDATE menu_items 
+             SET stock_quantity = $1::int, is_available = $2::boolean 
+             WHERE id = $3::int 
+             RETURNING id, name, stock_quantity, is_available`,
+            [newQuantity, isAvailable, id]
+        );
+
+        await client.query(
+            `INSERT INTO inventory_logs (menu_item_id, user_id, previous_quantity, new_quantity, adjustment_type, notes)
+             VALUES ($1::int, $2::int, $3::int, $4::int, $5, $6)`,
+            [id, userId, previousQuantity, newQuantity, adjustment_type.toUpperCase(), notes || null]
+        );
+
+        await client.query('COMMIT');
+
+        return res.status(200).json({
+            success: true,
+            message: `Stock updated successfully for ${currentItem.name}.`,
+            data: updateRes.rows[0]
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Update item stock error:', error.message);
+        return res.status(500).json({ success: false, message: 'Failed to update stock.' });
+    } finally {
+        client.release();
+    }
+};
+
 module.exports = {
     createOrder,
     getOrderById,
@@ -1644,5 +1728,6 @@ module.exports = {
     getDailySalesReport,
     cancelOrder,
     cancelTableSession,
-    requestBill
+    requestBill,
+    updateItemStock
 };

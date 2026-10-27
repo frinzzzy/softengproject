@@ -38,7 +38,8 @@ const {
   getDailySalesReport,
   cancelOrder,
   cancelTableSession,
-  requestBill
+  requestBill,
+  updateItemStock
 } = require('./orders');
 
 const {
@@ -362,7 +363,7 @@ app.post('/api/v1/dev/force-active-session', async (req, res) => {
 
 app.post('/api/v1/orders', createOrder);
 app.get('/api/v1/orders/unfinished', getUnfinishedOrders);
-app.get('/api/v1/orders/:id', getOrderById); // Idinagdag ang kinakailangang endpoint
+app.get('/api/v1/orders/:id', getOrderById);
 app.get('/api/v1/tables/:table_id/bill', touchSessionFromToken, getTableSessionBill);
 app.get('/api/v1/orders', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'), getOrders);
 
@@ -397,6 +398,8 @@ app.get('/api/v1/menu', touchSessionFromToken, async (req, res) => {
         m.name, 
         m.price, 
         m.is_available,
+        m.stock_quantity,
+        m.low_stock_threshold,
         m.category_id,
         m.image_url,
         COALESCE(
@@ -454,11 +457,11 @@ app.get('/api/v1/menu/:id/add-ons', async (req, res) => {
 });
 
 app.post('/api/v1/menu', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
-  const { category_id, name, price, is_available, image_url } = req.body;
+  const { category_id, name, price, is_available, stock_quantity, low_stock_threshold, image_url } = req.body;
   try {
     const result = await pool.query(
-      'INSERT INTO menu_items (category_id, name, price, is_available, image_url) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [category_id || null, name, price, is_available ?? true, image_url || null]
+      'INSERT INTO menu_items (category_id, name, price, is_available, stock_quantity, low_stock_threshold, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [category_id || null, name, price, is_available ?? true, stock_quantity ?? 50, low_stock_threshold ?? 10, image_url || null]
     );
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (err) {
@@ -469,16 +472,16 @@ app.post('/api/v1/menu', authenticateToken, authorizeRoles('ADMIN'), async (req,
 
 app.put('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { id } = req.params;
-  const { category_id, name, price, is_available, image_url } = req.body;
+  const { category_id, name, price, is_available, stock_quantity, low_stock_threshold, image_url } = req.body;
 
   try {
     const query = `
       UPDATE menu_items
-      SET category_id = $1, name = $2, price = $3, is_available = $4, image_url = $5
-      WHERE id = $6
+      SET category_id = $1, name = $2, price = $3, is_available = $4, stock_quantity = $5, low_stock_threshold = $6, image_url = $7
+      WHERE id = $8
       RETURNING *
     `;
-    const result = await pool.query(query, [category_id, name, price, is_available, image_url, id]);
+    const result = await pool.query(query, [category_id, name, price, is_available, stock_quantity ?? 50, low_stock_threshold ?? 10, image_url, id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Menu item not found.' });
@@ -521,6 +524,8 @@ app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('AD
     return res.status(500).json({ success: false, error: error.message });
   }
 });
+
+app.patch('/api/v1/menu/:id/stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN', 'CASHIER'), updateItemStock);
 
 app.delete('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { id } = req.params;
@@ -661,6 +666,8 @@ app.get('/api/v1/customer/menu', async (req, res) => {
         m.name, 
         m.price, 
         m.is_available,
+        m.stock_quantity,
+        m.low_stock_threshold,
         m.category_id,
         COALESCE(
           json_agg(
