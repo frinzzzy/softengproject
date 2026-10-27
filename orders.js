@@ -342,7 +342,7 @@ const createOrder = async (req, res) => {
             }
 
             const newStock = vItem.current_stock - vItem.quantity;
-            const makeUnavailable = newStock <= 0 ? false : true;
+            const makeUnavailable = newStock > 0;
 
             await client.query(
                 `UPDATE menu_items 
@@ -387,6 +387,8 @@ const createOrder = async (req, res) => {
                 message: `Order #${targetOrder.id} updated for Table #${targetOrder.table_id}`
             };
             io.emit('order_updated', updatePayload);
+            // 🚀 Naidagdag ang real-time broadcast para mag-update agad ang stock monitoring screen
+            io.emit('stock_updated', updatePayload);
             if (isAdditional) {
                 io.emit('additional_items_added', updatePayload);
             }
@@ -1699,6 +1701,16 @@ const updateItemStock = async (req, res) => {
         );
 
         await client.query('COMMIT');
+
+        const io = req.app.get('io');
+        if (io) {
+            io.emit('stock_updated', {
+                item_id: id,
+                stock_quantity: newQuantity,
+                is_available: isAvailable,
+                message: `Stock updated for ${currentItem.name}`
+            });
+        }
 
         return res.status(200).json({
             success: true,
