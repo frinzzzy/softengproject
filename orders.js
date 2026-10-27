@@ -387,7 +387,6 @@ const createOrder = async (req, res) => {
                 message: `Order #${targetOrder.id} updated for Table #${targetOrder.table_id}`
             };
             io.emit('order_updated', updatePayload);
-            // 🚀 Naidagdag ang real-time broadcast para mag-update agad ang stock monitoring screen
             io.emit('stock_updated', updatePayload);
             if (isAdditional) {
                 io.emit('additional_items_added', updatePayload);
@@ -572,6 +571,7 @@ const getTableSessionBill = async (req, res) => {
                 ts.id AS session_id,
                 t.id AS table_id,
                 t.table_number,
+                COALESCE(ts.session_status, 'ACTIVE') AS session_status,
                 COALESCE(SUM(o.total_amount), 0) AS grand_total,
                 COALESCE(
                     JSON_AGG(
@@ -632,7 +632,7 @@ const getTableSessionBill = async (req, res) => {
                 ON o.session_id = ts.id
                AND (o.order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW') AND o.order_status NOT IN ('CANCELLED', 'DECLINED', 'COMPLETED'))
             WHERE t.id = $1::int OR t.table_number = $1::int
-            GROUP BY ts.id, t.id, t.table_number;
+            GROUP BY ts.id, ts.session_status, t.id, t.table_number;
         `;
 
         const { rows } = await pool.query(query, [tableId]);
@@ -1434,7 +1434,6 @@ const cancelOrder = async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. I-lock ang order para masigurong hindi sabay-sabay na ma-process
         const checkResult = await client.query(
             'SELECT id, table_id, order_status FROM orders WHERE id = $1::int FOR UPDATE',
             [id]
@@ -1450,7 +1449,6 @@ const cancelOrder = async (req, res) => {
 
         const currentStatus = checkResult.rows[0].order_status;
 
-        // Tanging PENDING o NEW orders lamang ang puwedeng kanselahin nang direkta
         if (currentStatus !== 'PENDING' && currentStatus !== 'NEW') {
             await client.query('ROLLBACK');
             return res.status(400).json({
@@ -1459,13 +1457,11 @@ const cancelOrder = async (req, res) => {
             });
         }
 
-        // 2. KUNIN ANG LAHAT NG ITEMS AT QUANTITY NG ORDER NA ITO
         const itemsResult = await client.query(
             'SELECT menu_item_id, quantity FROM order_items WHERE order_id = $1::int',
             [id]
         );
 
-        // 3. IBALIK (RESTOCK) ANG STOCKS SA MENU_ITEMS AT MAG-ADD NG INVENTORY LOG
         for (const item of itemsResult.rows) {
             const menuItemRes = await client.query(
                 'SELECT stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
@@ -1477,7 +1473,6 @@ const cancelOrder = async (req, res) => {
                 const newStock = prevStock + item.quantity;
                 const isAvailable = newStock > 0;
 
-                // Restock quantity & update availability status
                 await client.query(
                     `UPDATE menu_items 
                      SET stock_quantity = $1::int, is_available = $2::boolean 
@@ -1485,7 +1480,6 @@ const cancelOrder = async (req, res) => {
                     [newStock, isAvailable, item.menu_item_id]
                 );
 
-                // Magtala sa audit logs
                 await client.query(
                     `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
                      VALUES ($1::int, $2::int, $3::int, 'ORDER_CANCELLED_RESTOCK', $4)`,
@@ -1494,7 +1488,6 @@ const cancelOrder = async (req, res) => {
             }
         }
 
-        // 4. BAGUHIN ANG STATUS NG ORDER PAPUNTANG 'CANCELLED'
         const updateQuery = `
             UPDATE orders 
             SET order_status = 'CANCELLED' 
@@ -1507,7 +1500,6 @@ const cancelOrder = async (req, res) => {
 
         await client.query('COMMIT');
 
-        // 5. MAG-EMIT NG REAL-TIME SOCKET EVENTS SA LAHAT NG NAKAKONEKTA
         const io = req.app.get('io');
         if (io) {
             io.emit('order_cancelled', {
@@ -1517,7 +1509,6 @@ const cancelOrder = async (req, res) => {
                 message: `Order #${cancelledOrder.id} has been cancelled.`
             });
 
-            // 🚀 BAGO: Mag-broadcast din ng stock_updated para mag-trigger ng instant UI update sa Stock Management screen
             io.emit('stock_updated', {
                 order_id: cancelledOrder.id,
                 message: `Stocks refilled after Order #${cancelledOrder.id} cancellation.`
@@ -1541,6 +1532,7 @@ const cancelOrder = async (req, res) => {
         client.release();
     }
 };
+
 const cancelTableSession = async (req, res) => {
     const { session_id } = req.params;
     const client = await pool.connect();
@@ -1654,6 +1646,7 @@ const requestBill = async (req, res) => {
         const activeSession = sessionRes.rows[0];
         const tableId = Number(activeSession.table_id);
 
+        // I-update ang table session para ma-record ang bill request activity
         await pool.query(
             `UPDATE table_sessions
              SET last_active_at = CURRENT_TIMESTAMP
