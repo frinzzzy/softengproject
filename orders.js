@@ -1295,9 +1295,17 @@ const getDailySalesReport = async (req, res) => {
         let groupBy = "TO_CHAR(created_at, 'YYYY-MM-DD')";
         let queryParams = [];
 
-        if (period === 'monthly') {
+        if (period === 'monthly' && start_date && end_date) {
+            dateCondition = "created_at::date BETWEEN $1 AND $2";
+            queryParams = [start_date, end_date];
+            groupBy = "TO_CHAR(created_at, 'YYYY-MM-DD')";
+        } else if (period === 'monthly') {
             dateCondition = "DATE_TRUNC('month', created_at) = DATE_TRUNC('month', CURRENT_DATE)";
             groupBy = "TO_CHAR(created_at, 'YYYY-MM-DD')";
+        } else if (period === 'yearly' && start_date && end_date) {
+            dateCondition = "created_at::date BETWEEN $1 AND $2";
+            queryParams = [start_date, end_date];
+            groupBy = "TO_CHAR(created_at, 'YYYY-MM')";
         } else if (period === 'yearly') {
             dateCondition = "DATE_TRUNC('year', created_at) = DATE_TRUNC('year', CURRENT_DATE)";
             groupBy = "TO_CHAR(created_at, 'YYYY-MM')";
@@ -1332,12 +1340,47 @@ const getDailySalesReport = async (req, res) => {
         `;
         let graphRes = await pool.query(graphQuery, queryParams);
 
-        // Safe fallback para lumitaw ang bar sa chart kung may gross sales naman pero walang saktong match sa group label
         if (graphRes.rows.length === 0 && parseFloat(rows[0].gross_sales) > 0) {
             graphRes.rows = [{
                 label: start_date || new Date().toISOString().split('T')[0],
                 total_sales: parseFloat(rows[0].gross_sales)
             }];
+        }
+
+        const topDishesQuery = `
+            SELECT 
+                m.name,
+                SUM(oi.quantity)::int AS quantity,
+                COALESCE(SUM(oi.quantity * oi.unit_price), 0)::numeric AS revenue
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id
+            JOIN payments p ON p.order_id = o.id
+            JOIN menu_items m ON m.id = oi.menu_item_id
+            WHERE p.status = 'COMPLETED' 
+              AND ${dateCondition.replace(/created_at/g, 'p.created_at')}
+            GROUP BY m.id, m.name
+            ORDER BY quantity DESC, revenue DESC
+            LIMIT 5;
+        `;
+        
+        let topDishesRes;
+        try {
+            topDishesRes = await pool.query(topDishesQuery, queryParams);
+        } catch (err) {
+            const fallbackTopQuery = `
+                SELECT 
+                    m.name,
+                    SUM(oi.quantity)::int AS quantity,
+                    COALESCE(SUM(oi.quantity * oi.unit_price), 0)::numeric AS revenue
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id
+                JOIN menu_items m ON m.id = oi.menu_item_id
+                WHERE o.order_status = 'COMPLETED'
+                GROUP BY m.id, m.name
+                ORDER BY quantity DESC, revenue DESC
+                LIMIT 5;
+            `;
+            topDishesRes = await pool.query(fallbackTopQuery);
         }
 
         return res.status(200).json({
@@ -1348,7 +1391,8 @@ const getDailySalesReport = async (req, res) => {
                 gross_sales: parseFloat(rows[0].gross_sales),
                 cash_sales: parseFloat(rows[0].cash_sales),
                 gcash_sales: parseFloat(rows[0].gcash_sales),
-                chart_breakdown: graphRes.rows
+                chart_breakdown: graphRes.rows,
+                top_items: topDishesRes.rows
             },
             message: 'Sales analytics generated successfully.'
         });
