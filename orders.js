@@ -387,6 +387,7 @@ const createOrder = async (req, res) => {
                 message: `Order #${targetOrder.id} updated for Table #${targetOrder.table_id}`
             };
             io.emit('order_updated', updatePayload);
+            // 🚀 Naidagdag ang real-time broadcast para mag-update agad ang stock monitoring screen
             io.emit('stock_updated', updatePayload);
             if (isAdditional) {
                 io.emit('additional_items_added', updatePayload);
@@ -1049,58 +1050,7 @@ const updateOrderStatus = async (req, res) => {
         });
     }
 
-    const client = await pool.connect();
-
     try {
-        await client.query('BEGIN');
-
-        const orderCheck = await client.query(
-            'SELECT id, table_id, order_status FROM orders WHERE id = $1::int FOR UPDATE',
-            [id]
-        );
-
-        if (orderCheck.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ success: false, message: 'Order not found.' });
-        }
-
-        const currentOrder = orderCheck.rows[0];
-        const oldStatus = currentOrder.order_status;
-
-        // 🔄 KUNG ANG STATUS AY IDINECLINE O KINANSELA MULA SA PENDING/PREPARING/NEW, IBALEK ANG STOCK (REFUND)
-        if ((formattedStatus === 'DECLINED' || formattedStatus === 'CANCELLED') && 
-            ['PENDING', 'NEW', 'PREPARING'].includes(oldStatus)) {
-            
-            const orderItemsRes = await client.query(
-                'SELECT menu_item_id, quantity FROM order_items WHERE order_id = $1::int',
-                [id]
-            );
-
-            for (const item of orderItemsRes.rows) {
-                const menuItemRes = await client.query(
-                    'SELECT id, stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
-                    [item.menu_item_id]
-                );
-
-                if (menuItemRes.rows.length > 0) {
-                    const currentStock = menuItemRes.rows[0].stock_quantity ?? 50;
-                    const restoredStock = currentStock + item.quantity;
-                    const isAvailable = restoredStock > 0;
-
-                    await client.query(
-                        'UPDATE menu_items SET stock_quantity = $1::int, is_available = $2::boolean WHERE id = $3::int',
-                        [restoredStock, isAvailable, item.menu_item_id]
-                    );
-
-                    await client.query(
-                        `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
-                         VALUES ($1::int, $2::int, $3::int, 'REFUND_RESTOCK', $4)`,
-                        [item.menu_item_id, currentStock, restoredStock, `Restored due to order #${id} status change to ${formattedStatus}`]
-                    );
-                }
-            }
-        }
-
         const query = `
             UPDATE orders 
             SET order_status = $1,
@@ -1109,13 +1059,18 @@ const updateOrderStatus = async (req, res) => {
             RETURNING id, table_id, order_status, decline_reason, total_amount, created_at;
         `;
 
-        const { rows } = await client.query(query, [
+        const { rows } = await pool.query(query, [
             formattedStatus,
             formattedStatus === 'DECLINED' ? decline_reason.trim() : null,
             id
         ]);
 
-        await client.query('COMMIT');
+        if (rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Order not found.'
+            });
+        }
 
         const updatedOrder = rows[0];
 
@@ -1128,8 +1083,6 @@ const updateOrderStatus = async (req, res) => {
                 decline_reason: updatedOrder.decline_reason,
                 message: `Order #${updatedOrder.id} status is now ${updatedOrder.order_status}`
             });
-            // 🚀 Real-time broadcast para mag-update agad ang Stock Management UI
-            io.emit('stock_updated', { order_id: updatedOrder.id });
         }
 
         return res.status(200).json({
@@ -1138,14 +1091,11 @@ const updateOrderStatus = async (req, res) => {
             data: updatedOrder
         });
     } catch (error) {
-        await client.query('ROLLBACK');
         console.error('Update status error:', error.message);
         return res.status(500).json({
             success: false,
             message: error.message || 'Internal server error.'
         });
-    } finally {
-        client.release();
     }
 };
 
@@ -1484,6 +1434,7 @@ const cancelOrder = async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // 1. I-lock ang order para masigurong hindi sabay-sabay na ma-process
         const checkResult = await client.query(
             'SELECT id, table_id, order_status FROM orders WHERE id = $1::int FOR UPDATE',
             [id]
@@ -1499,6 +1450,7 @@ const cancelOrder = async (req, res) => {
 
         const currentStatus = checkResult.rows[0].order_status;
 
+        // Tanging PENDING o NEW orders lamang ang puwedeng kanselahin nang direkta
         if (currentStatus !== 'PENDING' && currentStatus !== 'NEW') {
             await client.query('ROLLBACK');
             return res.status(400).json({
@@ -1507,11 +1459,13 @@ const cancelOrder = async (req, res) => {
             });
         }
 
+        // 2. KUNIN ANG LAHAT NG ITEMS AT QUANTITY NG ORDER NA ITO
         const itemsResult = await client.query(
             'SELECT menu_item_id, quantity FROM order_items WHERE order_id = $1::int',
             [id]
         );
 
+        // 3. IBALIK (RESTOCK) ANG STOCKS SA MENU_ITEMS AT MAG-ADD NG INVENTORY LOG
         for (const item of itemsResult.rows) {
             const menuItemRes = await client.query(
                 'SELECT stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
@@ -1523,6 +1477,7 @@ const cancelOrder = async (req, res) => {
                 const newStock = prevStock + item.quantity;
                 const isAvailable = newStock > 0;
 
+                // Restock quantity & update availability status
                 await client.query(
                     `UPDATE menu_items 
                      SET stock_quantity = $1::int, is_available = $2::boolean 
@@ -1530,6 +1485,7 @@ const cancelOrder = async (req, res) => {
                     [newStock, isAvailable, item.menu_item_id]
                 );
 
+                // Magtala sa audit logs
                 await client.query(
                     `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
                      VALUES ($1::int, $2::int, $3::int, 'ORDER_CANCELLED_RESTOCK', $4)`,
@@ -1538,6 +1494,7 @@ const cancelOrder = async (req, res) => {
             }
         }
 
+        // 4. BAGUHIN ANG STATUS NG ORDER PAPUNTANG 'CANCELLED'
         const updateQuery = `
             UPDATE orders 
             SET order_status = 'CANCELLED' 
@@ -1550,6 +1507,7 @@ const cancelOrder = async (req, res) => {
 
         await client.query('COMMIT');
 
+        // 5. MAG-EMIT NG REAL-TIME SOCKET EVENTS SA LAHAT NG NAKAKONEKTA
         const io = req.app.get('io');
         if (io) {
             io.emit('order_cancelled', {
@@ -1559,6 +1517,7 @@ const cancelOrder = async (req, res) => {
                 message: `Order #${cancelledOrder.id} has been cancelled.`
             });
 
+            // 🚀 BAGO: Mag-broadcast din ng stock_updated para mag-trigger ng instant UI update sa Stock Management screen
             io.emit('stock_updated', {
                 order_id: cancelledOrder.id,
                 message: `Stocks refilled after Order #${cancelledOrder.id} cancellation.`
