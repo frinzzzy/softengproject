@@ -1127,7 +1127,7 @@ const updateOrderStatus = async (req, res) => {
 
                     await client.query(
                         `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
-                         VALUES ($1::int, $2::int, $3::int, 'ORDER_DECLINED_RESTOCK', $4)`,
+                         VALUES ($1::int, $2::int, $3::int, 'MANUAL_ADJUSTMENT', $4)`,
                         [item.menu_item_id, prevStock, newStock, `Restocked due to Decline of Order #${id}`]
                     );
                 }
