@@ -364,7 +364,8 @@ app.post('/api/v1/dev/force-active-session', async (req, res) => {
 app.post('/api/v1/orders', createOrder);
 app.get('/api/v1/orders/unfinished', getUnfinishedOrders);
 app.get('/api/v1/orders/:id', getOrderById);
-app.get('/api/v1/tables/:table_id/bill', touchSessionFromToken, getTableSessionBill);
+// TEMP DISABLED (Bill Request feature on hold)
+// app.get('/api/v1/tables/:table_id/bill', touchSessionFromToken, getTableSessionBill);
 app.get('/api/v1/orders', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'), getOrders);
 
 app.get('/api/v1/customer/orders/live', getCustomerLiveOrders);
@@ -554,8 +555,9 @@ app.get('/api/v1/categories', async (req, res) => {
   }
 });
 
-app.get('/api/v1/customer/sessions/:session_id/bill', touchSessionFromToken, requestBill);
-app.get('/api/v1/tables/:table_id/bill', touchSessionFromToken, getTableSessionBill);
+// TEMP DISABLED (Bill Request feature on hold)
+// app.get('/api/v1/customer/sessions/:session_id/bill', touchSessionFromToken, requestBill);
+// app.get('/api/v1/tables/:table_id/bill', touchSessionFromToken, getTableSessionBill);
 
 app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN', 'WAITER'), async (req, res) => {
   const { table_id } = req.body;

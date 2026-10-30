@@ -182,7 +182,8 @@ const createOrder = async (req, res) => {
                 `UPDATE table_sessions
                  SET session_status = 'ACTIVE',
                      closed_at = NULL,
-                     last_active_at = CURRENT_TIMESTAMP
+                     last_active_at = CURRENT_TIMESTAMP,
+                     bill_requested_at = NULL
                  WHERE id = $1::int
                    AND table_id = $2::int
                    AND UPPER(session_status) NOT IN ('ACTIVE', 'OPEN')`,
@@ -301,15 +302,33 @@ const createOrder = async (req, res) => {
                 });
             }
 
-            const parentRes = await client.query(
-                `UPDATE orders
-                 SET total_amount = total_amount + $1::numeric,
-                     is_additional_order = TRUE
-                 WHERE id = $2::int
-                 RETURNING *`,
-                [additionalTotal, parentOrderId]
-            );
-            targetOrder = parentRes.rows[0];
+            const parentStatus = parentCheck.rows[0].order_status;
+
+            if (parentStatus === 'PENDING' || parentStatus === 'NEW') {
+                const parentRes = await client.query(
+                    `UPDATE orders
+                     SET total_amount = total_amount + $1::numeric,
+                         is_additional_order = TRUE
+                     WHERE id = $2::int
+                     RETURNING *`,
+                    [additionalTotal, parentOrderId]
+                );
+                targetOrder = parentRes.rows[0];
+            } else {
+                const additionalOrderRes = await client.query(
+                    `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status)
+                     VALUES ($1::int, $2::int, $3::int, TRUE, $4::uuid, $5::numeric, 'PENDING')
+                     RETURNING *`,
+                    [
+                        targetSessionId,
+                        tableId,
+                        parentOrderId,
+                        crypto.randomUUID(),
+                        additionalTotal
+                    ]
+                );
+                targetOrder = additionalOrderRes.rows[0];
+            }
         } else {
             const newOrderRes = await client.query(
                 `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status)
@@ -572,6 +591,7 @@ const getTableSessionBill = async (req, res) => {
                 t.id AS table_id,
                 t.table_number,
                 COALESCE(ts.session_status, 'ACTIVE') AS session_status,
+                COALESCE(ts.bill_requested_at, NULL) AS bill_requested_at,
                 COALESCE(SUM(o.total_amount), 0) AS grand_total,
                 COALESCE(
                     JSON_AGG(
@@ -632,7 +652,7 @@ const getTableSessionBill = async (req, res) => {
                 ON o.session_id = ts.id
                AND (o.order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW') AND o.order_status NOT IN ('CANCELLED', 'DECLINED', 'COMPLETED'))
             WHERE t.id = $1::int OR t.table_number = $1::int
-            GROUP BY ts.id, ts.session_status, t.id, t.table_number;
+            GROUP BY ts.id, ts.session_status, ts.bill_requested_at, t.id, t.table_number;
         `;
 
         const { rows } = await pool.query(query, [tableId]);
@@ -644,14 +664,19 @@ const getTableSessionBill = async (req, res) => {
                     table_id: tableId,
                     table_number: tableId,
                     grand_total: 0,
-                    orders: []
+                    orders: [],
+                    bill_requested_at: null,
+                    bill_requested: false
                 }
             });
         }
 
         return res.status(200).json({
             success: true,
-            data: rows[0]
+            data: {
+                ...rows[0],
+                bill_requested: rows[0].bill_requested_at != null
+            }
         });
     } catch (error) {
         console.error('Fetch table session bill error:', error.message);
@@ -710,9 +735,11 @@ const getOrders = async (req, res) => {
                             )
                         )
                     ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
-                ) AS items
+                ) AS items,
+                ts.bill_requested_at AS bill_requested_at
             FROM orders o
             LEFT JOIN tables t ON o.table_id = t.id
+            LEFT JOIN table_sessions ts ON o.session_id = ts.id
             LEFT JOIN order_items oi ON o.id = oi.order_id
             LEFT JOIN menu_items m ON oi.menu_item_id = m.id
         `;
@@ -741,7 +768,7 @@ const getOrders = async (req, res) => {
             query += ` WHERE ` + conditions.join(' AND ');
         }
 
-        query += ` GROUP BY o.id, t.table_number ORDER BY o.created_at DESC;`;
+        query += ` GROUP BY o.id, t.table_number, ts.bill_requested_at ORDER BY o.created_at DESC;`;
 
         const { rows } = await pool.query(query, values);
 
@@ -1050,8 +1077,64 @@ const updateOrderStatus = async (req, res) => {
         });
     }
 
+    const client = await pool.connect();
+
     try {
-        const query = `
+        await client.query('BEGIN');
+
+        const checkResult = await client.query(
+            'SELECT id, table_id, order_status, decline_reason FROM orders WHERE id = $1::int FOR UPDATE',
+            [id]
+        );
+
+        if (checkResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                message: 'Order not found.'
+            });
+        }
+
+        const previousStatus = checkResult.rows[0].order_status;
+
+        const shouldRestock = formattedStatus === 'DECLINED'
+            && previousStatus !== 'DECLINED'
+            && previousStatus !== 'CANCELLED';
+
+        if (shouldRestock) {
+            const itemsResult = await client.query(
+                'SELECT menu_item_id, quantity FROM order_items WHERE order_id = $1::int',
+                [id]
+            );
+
+            for (const item of itemsResult.rows) {
+                const menuItemRes = await client.query(
+                    'SELECT stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
+                    [item.menu_item_id]
+                );
+
+                if (menuItemRes.rows.length > 0) {
+                    const prevStock = menuItemRes.rows[0].stock_quantity ?? 0;
+                    const newStock = prevStock + item.quantity;
+                    const isAvailable = newStock > 0;
+
+                    await client.query(
+                        `UPDATE menu_items 
+                         SET stock_quantity = $1::int, is_available = $2::boolean 
+                         WHERE id = $3::int`,
+                        [newStock, isAvailable, item.menu_item_id]
+                    );
+
+                    await client.query(
+                        `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
+                         VALUES ($1::int, $2::int, $3::int, 'ORDER_DECLINED_RESTOCK', $4)`,
+                        [item.menu_item_id, prevStock, newStock, `Restocked due to Decline of Order #${id}`]
+                    );
+                }
+            }
+        }
+
+        const updateQuery = `
             UPDATE orders 
             SET order_status = $1,
                 decline_reason = $2
@@ -1059,20 +1142,15 @@ const updateOrderStatus = async (req, res) => {
             RETURNING id, table_id, order_status, decline_reason, total_amount, created_at;
         `;
 
-        const { rows } = await pool.query(query, [
+        const { rows } = await client.query(updateQuery, [
             formattedStatus,
             formattedStatus === 'DECLINED' ? decline_reason.trim() : null,
             id
         ]);
 
-        if (rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found.'
-            });
-        }
-
         const updatedOrder = rows[0];
+
+        await client.query('COMMIT');
 
         const io = req.app.get('io');
         if (io) {
@@ -1083,6 +1161,13 @@ const updateOrderStatus = async (req, res) => {
                 decline_reason: updatedOrder.decline_reason,
                 message: `Order #${updatedOrder.id} status is now ${updatedOrder.order_status}`
             });
+
+            if (shouldRestock) {
+                io.emit('stock_updated', {
+                    order_id: updatedOrder.id,
+                    message: `Stocks refilled after Order #${updatedOrder.id} was declined.`
+                });
+            }
         }
 
         return res.status(200).json({
@@ -1091,11 +1176,14 @@ const updateOrderStatus = async (req, res) => {
             data: updatedOrder
         });
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error('Update status error:', error.message);
         return res.status(500).json({
             success: false,
             message: error.message || 'Internal server error.'
         });
+    } finally {
+        client.release();
     }
 };
 
@@ -1647,9 +1735,12 @@ const requestBill = async (req, res) => {
         const tableId = Number(activeSession.table_id);
 
         // I-update ang table session para ma-record ang bill request activity
+        // (session-level state; hindi natin binabago ang core order_status para
+        //  hindi masira ang kitchen/cashier workflows)
         await pool.query(
             `UPDATE table_sessions
-             SET last_active_at = CURRENT_TIMESTAMP
+             SET last_active_at = CURRENT_TIMESTAMP,
+                 bill_requested_at = CURRENT_TIMESTAMP
              WHERE id = $1::int
                AND UPPER(session_status) IN ('ACTIVE', 'OPEN')`,
             [activeSession.id]
@@ -1675,6 +1766,8 @@ const requestBill = async (req, res) => {
             io.emit('bill_requested', {
                 table_id: tableId,
                 session_id: activeSession.id,
+                bill_requested_at: new Date().toISOString(),
+                bill_status: 'REQUESTED',
                 total_orders: totalOrders,
                 grand_total: grandTotal,
                 requested_at: new Date().toISOString(),
@@ -1686,7 +1779,9 @@ const requestBill = async (req, res) => {
             table_id: tableId,
             session_id: activeSession.id,
             total_orders: totalOrders,
-            grand_total: grandTotal.toFixed(2)
+            grand_total: grandTotal.toFixed(2),
+            bill_requested_at: new Date().toISOString(),
+            bill_status: 'REQUESTED'
         };
 
         return res.status(200).json({

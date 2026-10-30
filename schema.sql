@@ -51,8 +51,14 @@ CREATE TABLE table_sessions (
     table_id INT REFERENCES tables(id),
     session_status VARCHAR(20) DEFAULT 'ACTIVE' CHECK (session_status IN ('ACTIVE', 'CLOSED')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    closed_at TIMESTAMP
+    closed_at TIMESTAMP,
+    last_active_at TIMESTAMP,
+    bill_requested_at TIMESTAMP
 );
+
+-- Backwards-compatible migrations for existing deployments
+ALTER TABLE table_sessions ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP;
+ALTER TABLE table_sessions ADD COLUMN IF NOT EXISTS bill_requested_at TIMESTAMP;
 
 CREATE TABLE table_assistance_requests (
     id SERIAL PRIMARY KEY,
