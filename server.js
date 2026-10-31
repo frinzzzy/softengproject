@@ -17,6 +17,8 @@ const assistanceRoutes = require('./assistance');
 
 const { startAutoCloseMonitor } = require('./autoclose');
 
+const eventHub = require('./eventHub');
+
 const { 
   createEventReservation, 
   getEventReservations, 
@@ -58,6 +60,9 @@ const io = new Server(server, {
 });
 
 app.set('io', io);
+app.set('event_hub', eventHub);
+
+eventHub.setIO(io);
 
 const PORT = process.env.PORT || 5000;
 
@@ -93,7 +98,7 @@ io.on('connection', (socket) => {
   });
 });
 
-startAutoCloseMonitor(io);
+startAutoCloseMonitor(eventHub);
 
 const logAuthDebug = (event, details) => {
   if (process.env.DEBUG_API_RESPONSES === 'true') {

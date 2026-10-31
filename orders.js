@@ -1,26 +1,14 @@
 const pool = require('./db');
 const crypto = require('crypto');
+const inventoryService = require('./inventoryService');
+const orderService = require('./orderService');
+const paymentService = require('./paymentService');
 
 const logApiResponse = (endpoint, details) => {
     if (process.env.DEBUG_API_RESPONSES === 'true') {
         console.log(`[API Debug] ${endpoint}`, details);
     }
 };
-
-function computeStatutoryDiscount(grossAmount, isEligible) {
-    if (!isEligible) {
-        return { netTotal: grossAmount, discount: 0 };
-    }
-
-    const vatExemptSales = grossAmount / 1.12;
-    const discount = vatExemptSales * 0.20;
-    const netTotal = grossAmount - discount;
-
-    return {
-        netTotal: parseFloat(netTotal.toFixed(2)),
-        discount: parseFloat(discount.toFixed(2))
-    };
-}
 
 const createOrder = async (req, res) => {
     const {
@@ -37,407 +25,83 @@ const createOrder = async (req, res) => {
     const parentOrderId = parent_order_id == null ? null : Number(parent_order_id);
     const isAdditional = is_additional_order === true;
 
-    if (!Number.isSafeInteger(tableId) || tableId <= 0 ||
-        (sessionId !== null && (!Number.isSafeInteger(sessionId) || sessionId <= 0))) {
-        return res.status(400).json({
-            success: false,
-            message: 'A valid table_id and session_id are required.'
-        });
-    }
-
-    if (is_additional_order != null && typeof is_additional_order !== 'boolean') {
-        return res.status(400).json({
-            success: false,
-            message: 'is_additional_order must be a boolean.'
-        });
-    }
-
-    if ((isAdditional && (!Number.isSafeInteger(parentOrderId) || parentOrderId <= 0)) ||
-        (!isAdditional && parentOrderId !== null)) {
-        return res.status(400).json({
-            success: false,
-            message: 'A valid parent_order_id is required only for an additional order.'
-        });
-    }
-
-    if (!Array.isArray(items) || items.length === 0 || items.some(item =>
-        !item ||
-        !Number.isSafeInteger(Number(item.menu_item_id)) ||
-        Number(item.menu_item_id) <= 0 ||
-        !Number.isSafeInteger(Number(item.quantity)) ||
-        Number(item.quantity) <= 0 ||
-        (item.addons != null && !Array.isArray(item.addons)) ||
-        (Array.isArray(item.addons) && item.addons.some(addon =>
-            !addon ||
-            !Number.isSafeInteger(Number(addon.addon_id)) ||
-            Number(addon.addon_id) <= 0
-        ))
-    )) {
-        return res.status(400).json({
-            success: false,
-            message: 'Order items must have valid menu_item_id values, positive quantities, and valid add-ons.'
-        });
-    }
-
     const idempotencyKey = req.headers['x-idempotency-key'] || client_order_id;
-    if (typeof idempotencyKey !== 'string' || idempotencyKey.trim().length === 0) {
-        return res.status(400).json({
+
+    const result = await orderService.createOrder({
+        tableId,
+        sessionId,
+        parentOrderId,
+        isAdditional,
+        items,
+        clientOrderId: idempotencyKey,
+        idempotencyKey
+    });
+
+    if (!result.ok) {
+        return res.status(result.statusCode || 500).json({
             success: false,
-            message: 'An x-idempotency-key header or client_order_id is required.'
+            message: result.message
         });
     }
 
-    const trimmedIdempotencyKey = idempotencyKey.trim();
-    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    let clientOrderId = trimmedIdempotencyKey;
-    if (!uuidPattern.test(clientOrderId)) {
-        const bytes = crypto.createHash('sha256').update(clientOrderId).digest().subarray(0, 16);
-        bytes[6] = (bytes[6] & 0x0f) | 0x50;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        clientOrderId = [
-            bytes.subarray(0, 4).toString('hex'),
-            bytes.subarray(4, 6).toString('hex'),
-            bytes.subarray(6, 8).toString('hex'),
-            bytes.subarray(8, 10).toString('hex'),
-            bytes.subarray(10, 16).toString('hex')
-        ].join('-');
-    }
-
-    const client = await pool.connect();
-
-    try {
-        await client.query('BEGIN');
-
-        const tableResult = await client.query(
-            'SELECT id FROM tables WHERE id = $1::int FOR UPDATE',
-            [tableId]
-        );
-
-        if (tableResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ success: false, message: 'Table not found.' });
-        }
-
-        const existingOrder = await client.query(
-            `SELECT o.*
-             FROM orders o
-             WHERE o.client_order_id = $1::uuid
-             UNION ALL
-             SELECT o.*
-             FROM order_submissions os
-             JOIN orders o ON o.id = os.order_id
-             WHERE os.client_order_id = $1::uuid
-             LIMIT 1`,
-            [clientOrderId]
-        );
-
-        if (existingOrder.rows.length > 0) {
-            await client.query('COMMIT');
-            return res.status(200).json({
-                success: true,
-                message: 'Order replay handled.',
-                data: { order: existingOrder.rows[0] }
-            });
-        }
-
-        let targetSessionId = sessionId;
-        if (targetSessionId !== null) {
-            const sessionRes = await client.query(
-                `SELECT id
-                 FROM table_sessions
-                 WHERE id = $1::int
-                   AND table_id = $2::int
-                 FOR UPDATE`,
-                [targetSessionId, tableId]
-            );
-
-            if (sessionRes.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({
-                    success: false,
-                    message: 'The requested table session does not belong to this table.'
-                });
-            }
-
-            const activeSessionRes = await client.query(
-                `SELECT id
-                 FROM table_sessions
-                 WHERE table_id = $1::int
-                   AND id <> $2::int
-                   AND UPPER(session_status) IN ('ACTIVE', 'OPEN')
-                 LIMIT 1
-                 FOR UPDATE`,
-                [tableId, targetSessionId]
-            );
-
-            if (activeSessionRes.rows.length > 0) {
-                await client.query('ROLLBACK');
-                return res.status(409).json({
-                    success: false,
-                    message: 'Another active session already exists for this table.'
-                });
-            }
-
-            await client.query(
-                `UPDATE table_sessions
-                 SET session_status = 'ACTIVE',
-                     closed_at = NULL,
-                     last_active_at = CURRENT_TIMESTAMP,
-                     bill_requested_at = NULL
-                 WHERE id = $1::int
-                   AND table_id = $2::int
-                   AND UPPER(session_status) NOT IN ('ACTIVE', 'OPEN')`,
-                [targetSessionId, tableId]
-            );
-        } else {
-            const sessionRes = await client.query(
-                `SELECT id
-                 FROM table_sessions
-                 WHERE table_id = $1::int
-                   AND UPPER(session_status) IN ('ACTIVE', 'OPEN')
-                 ORDER BY id DESC
-                 LIMIT 1
-                 FOR UPDATE`,
-                [tableId]
-            );
-
-            if (sessionRes.rows.length === 0) {
-                const newSession = await client.query(
-                    `INSERT INTO table_sessions (table_id, session_status)
-                     VALUES ($1::int, 'ACTIVE')
-                     RETURNING id`,
-                    [tableId]
-                );
-                targetSessionId = newSession.rows[0].id;
-            } else {
-                targetSessionId = sessionRes.rows[0].id;
-            }
-        }
-
-        let additionalTotalCents = 0;
-        const verifiedItems = [];
-
-        for (const item of items) {
-            const menuRes = await client.query(
-                'SELECT id, name, price, is_available, stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
-                [Number(item.menu_item_id)]
-            );
-
-            if (menuRes.rows.length === 0) {
-                throw Object.assign(new Error(`Menu item #${item.menu_item_id} not found.`), { statusCode: 400 });
-            }
-
-            const menuItem = menuRes.rows[0];
-            if (!menuItem.is_available) {
-                throw Object.assign(new Error(`Menu item #${item.menu_item_id} is unavailable.`), { statusCode: 400 });
-            }
-
-            const qty = Number(item.quantity);
-            const currentStock = menuItem.stock_quantity ?? 50;
-
-            if (currentStock < qty) {
-                throw Object.assign(new Error(`Insufficient stock for ${menuItem.name}. Only ${currentStock} left.`), { statusCode: 400 });
-            }
-
-            const unitPrice = parseFloat(menuItem.price);
-            const unitPriceCents = Math.round(unitPrice * 100);
-            additionalTotalCents += unitPriceCents * qty;
-
-            const verifiedAddons = [];
-            for (const addon of item.addons || []) {
-                const addonId = Number(addon.addon_id);
-                const addonRes = await client.query(
-                    `SELECT price
-                     FROM menu_addons
-                     WHERE id = $1::int AND menu_item_id = $2::int`,
-                    [addonId, menuItem.id]
-                );
-
-                if (addonRes.rows.length === 0) {
-                    throw Object.assign(
-                        new Error(`Add-on #${addonId} is invalid for menu item #${menuItem.id}.`),
-                        { statusCode: 400 }
-                    );
-                }
-
-                const addonPrice = parseFloat(addonRes.rows[0].price);
-                additionalTotalCents += Math.round(addonPrice * 100) * qty;
-                verifiedAddons.push({
-                    addon_id: addonId,
-                    price: addonPrice
-                });
-            }
-
-            verifiedItems.push({
-                menu_item_id: menuItem.id,
-                item_name: menuItem.name,
-                name: menuItem.name,
-                quantity: qty,
-                unit_price: unitPrice,
-                current_stock: currentStock,
-                addons: verifiedAddons
-            });
-        }
-
-        const additionalTotal = (additionalTotalCents / 100).toFixed(2);
-
-        let targetOrder;
-        if (isAdditional) {
-            const parentCheck = await client.query(
-                `SELECT *
-                 FROM orders
-                 WHERE id = $1::int
-                   AND session_id = $2::int
-                   AND table_id = $3::int
-                   AND (order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW') AND order_status NOT IN ('CANCELLED', 'DECLINED', 'COMPLETED'))
-                 FOR UPDATE`,
-                [parentOrderId, targetSessionId, tableId]
-            );
-
-            if (parentCheck.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(404).json({
-                    success: false,
-                    message: 'Active parent order not found for this table session.'
-                });
-            }
-
-            const parentStatus = parentCheck.rows[0].order_status;
-
-            if (parentStatus === 'PENDING' || parentStatus === 'NEW') {
-                const parentRes = await client.query(
-                    `UPDATE orders
-                     SET total_amount = total_amount + $1::numeric,
-                         is_additional_order = TRUE
-                     WHERE id = $2::int
-                     RETURNING *`,
-                    [additionalTotal, parentOrderId]
-                );
-                targetOrder = parentRes.rows[0];
-            } else {
-                const additionalOrderRes = await client.query(
-                    `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status)
-                     VALUES ($1::int, $2::int, $3::int, TRUE, $4::uuid, $5::numeric, 'PENDING')
-                     RETURNING *`,
-                    [
-                        targetSessionId,
-                        tableId,
-                        parentOrderId,
-                        crypto.randomUUID(),
-                        additionalTotal
-                    ]
-                );
-                targetOrder = additionalOrderRes.rows[0];
-            }
-        } else {
-            const newOrderRes = await client.query(
-                `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status)
-                 VALUES ($1::int, $2::int, NULL, FALSE, $3::uuid, $4::numeric, 'PENDING')
-                 RETURNING *`,
-                [
-                    targetSessionId,
-                    tableId,
-                    clientOrderId,
-                    additionalTotal
-                ]
-            );
-            targetOrder = newOrderRes.rows[0];
-        }
-
-        for (const vItem of verifiedItems) {
-            const orderItem = await client.query(
-                `INSERT INTO order_items (order_id, menu_item_id, quantity, unit_price)
-                 VALUES ($1::int, $2::int, $3::int, $4::numeric)
-                 RETURNING id`,
-                [targetOrder.id, vItem.menu_item_id, vItem.quantity, vItem.unit_price]
-            );
-
-            for (const addon of vItem.addons) {
-                await client.query(
-                    `INSERT INTO order_item_addons (order_item_id, addon_id, price)
-                     VALUES ($1::int, $2::int, $3::numeric)`,
-                    [orderItem.rows[0].id, addon.addon_id, addon.price]
-                );
-            }
-
-            const newStock = vItem.current_stock - vItem.quantity;
-            const makeUnavailable = newStock > 0;
-
-            await client.query(
-                `UPDATE menu_items 
-                 SET stock_quantity = $1::int, is_available = $2::boolean 
-                 WHERE id = $3::int`,
-                [newStock, makeUnavailable, vItem.menu_item_id]
-            );
-
-            await client.query(
-                `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
-                 VALUES ($1::int, $2::int, $3::int, 'ORDER_DEDUCTION', $4)`,
-                [vItem.menu_item_id, vItem.current_stock, newStock, `Deducted for Order #${targetOrder.id}`]
-            );
-        }
-
-        if (isAdditional) {
-            await client.query(
-                `INSERT INTO order_submissions (client_order_id, order_id)
-                 VALUES ($1::uuid, $2::int)`,
-                [clientOrderId, targetOrder.id]
-            );
-        }
-
-        await client.query(
-            'UPDATE table_sessions SET last_active_at = CURRENT_TIMESTAMP WHERE id = $1::int',
-            [targetSessionId]
-        );
-
-        await client.query('COMMIT');
-
-        const io = req.app.get('io');
-        if (io) {
-            const updatePayload = {
-                order_id: targetOrder.id,
-                session_id: targetOrder.session_id,
-                table_id: targetOrder.table_id,
-                status: targetOrder.order_status,
-                total_amount: targetOrder.total_amount,
-                items: verifiedItems,
-                added_items: isAdditional ? verifiedItems : [],
-                is_additional_order: isAdditional,
-                message: `Order #${targetOrder.id} updated for Table #${targetOrder.table_id}`
-            };
-            io.emit('order_updated', updatePayload);
-            io.emit('stock_updated', updatePayload);
-            if (isAdditional) {
-                io.emit('additional_items_added', updatePayload);
-            }
-        }
-
-        return res.status(201).json({
+    if (result.replayed) {
+        return res.status(200).json({
             success: true,
-            message: isAdditional ? 'Additional items added to the parent order.' : 'New order created.',
-            data: {
-                order: targetOrder,
-                added_items: verifiedItems
-            }
+            message: 'Order replay handled.',
+            data: { order: result.order }
         });
-
-    } catch (error) {
-        try {
-            await client.query('ROLLBACK');
-        } catch (rollbackError) {
-            console.error('Order creation rollback error:', rollbackError.message);
-        }
-        console.error('Order creation error:', error.message);
-        const statusCode = error.statusCode === 400 ? 400 : 500;
-        return res.status(statusCode).json({
-            success: false,
-            message: statusCode === 400 ? error.message : 'Failed to create order.'
-        });
-    } finally {
-        client.release();
     }
-};
 
+    const eventHub = req.app.get('event_hub');
+    if (eventHub) {
+        eventHub.emitOrderUpdated({
+            order_id: result.order.id,
+            session_id: result.order.session_id,
+            table_id: result.order.table_id,
+            status: result.order.order_status,
+            total_amount: result.order.total_amount,
+            items: result.added_items,
+            added_items: isAdditional ? result.added_items : [],
+            is_additional_order: isAdditional,
+            message: `Order #${result.order.id} updated for Table #${result.order.table_id}`
+        });
+
+        eventHub.emitStockUpdated({
+            order_id: result.order.id,
+            session_id: result.order.session_id,
+            table_id: result.order.table_id,
+            status: result.order.order_status,
+            total_amount: result.order.total_amount,
+            items: result.added_items,
+            added_items: isAdditional ? result.added_items : [],
+            is_additional_order: isAdditional,
+            message: `Order #${result.order.id} updated for Table #${result.order.table_id}`
+        });
+
+        if (isAdditional) {
+            eventHub.emitAdditionalItemsAdded({
+                order_id: result.order.id,
+                session_id: result.order.session_id,
+                table_id: result.order.table_id,
+                status: result.order.order_status,
+                total_amount: result.order.total_amount,
+                items: result.added_items,
+                added_items: result.added_items,
+                is_additional_order: isAdditional,
+                message: `Order #${result.order.id} updated for Table #${result.order.table_id}`
+            });
+        }
+    }
+
+    return res.status(201).json({
+        success: true,
+        message: isAdditional ? 'Additional items added to the parent order.' : 'New order created.',
+        data: {
+            order: result.order,
+            added_items: result.added_items
+        }
+    });
+};
 const getOrderById = async (req, res) => {
     try {
         const rawId = req.params.id;
@@ -1077,95 +741,30 @@ const updateOrderStatus = async (req, res) => {
         });
     }
 
-    const client = await pool.connect();
-
     try {
-        await client.query('BEGIN');
+        const result = await orderService.updateOrderStatus(Number(id), formattedStatus, decline_reason);
 
-        const checkResult = await client.query(
-            'SELECT id, table_id, order_status, decline_reason FROM orders WHERE id = $1::int FOR UPDATE',
-            [id]
-        );
-
-        if (checkResult.rows.length === 0) {
-            await client.query('ROLLBACK');
+        if (result.notFound) {
             return res.status(404).json({
                 success: false,
                 message: 'Order not found.'
             });
         }
 
-        const previousStatus = checkResult.rows[0].order_status;
-
-        const shouldRestock = formattedStatus === 'DECLINED'
-            && previousStatus !== 'DECLINED'
-            && previousStatus !== 'CANCELLED';
-
-        if (shouldRestock) {
-            const itemsResult = await client.query(
-                'SELECT menu_item_id, quantity FROM order_items WHERE order_id = $1::int',
-                [id]
-            );
-
-            for (const item of itemsResult.rows) {
-                const menuItemRes = await client.query(
-                    'SELECT stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
-                    [item.menu_item_id]
-                );
-
-                if (menuItemRes.rows.length > 0) {
-                    const prevStock = menuItemRes.rows[0].stock_quantity ?? 0;
-                    const newStock = prevStock + item.quantity;
-                    const isAvailable = newStock > 0;
-
-                    await client.query(
-                        `UPDATE menu_items 
-                         SET stock_quantity = $1::int, is_available = $2::boolean 
-                         WHERE id = $3::int`,
-                        [newStock, isAvailable, item.menu_item_id]
-                    );
-
-                    await client.query(
-                        `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
-                         VALUES ($1::int, $2::int, $3::int, 'MANUAL_ADJUSTMENT', $4)`,
-                        [item.menu_item_id, prevStock, newStock, `Restocked due to Decline of Order #${id}`]
-                    );
-                }
-            }
-        }
-
-        const updateQuery = `
-            UPDATE orders 
-            SET order_status = $1,
-                decline_reason = $2
-            WHERE id = $3::int
-            RETURNING id, table_id, order_status, decline_reason, total_amount, created_at;
-        `;
-
-        const { rows } = await client.query(updateQuery, [
-            formattedStatus,
-            formattedStatus === 'DECLINED' ? decline_reason.trim() : null,
-            id
-        ]);
-
-        const updatedOrder = rows[0];
-
-        await client.query('COMMIT');
-
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('order_status_updated', {
-                order_id: updatedOrder.id,
-                table_id: updatedOrder.table_id,
-                status: updatedOrder.order_status,
-                decline_reason: updatedOrder.decline_reason,
-                message: `Order #${updatedOrder.id} status is now ${updatedOrder.order_status}`
+        const eventHub = req.app.get('event_hub');
+        if (eventHub) {
+            eventHub.emitOrderStatusUpdated({
+                order_id: result.order.id,
+                table_id: result.order.table_id,
+                status: result.order.order_status,
+                decline_reason: result.order.decline_reason,
+                message: `Order #${result.order.id} status is now ${result.order.order_status}`
             });
 
-            if (shouldRestock) {
-                io.emit('stock_updated', {
-                    order_id: updatedOrder.id,
-                    message: `Stocks refilled after Order #${updatedOrder.id} was declined.`
+            if (result.shouldRestock) {
+                eventHub.emitStockUpdated({
+                    order_id: result.order.id,
+                    message: `Stocks refilled after Order #${result.order.id} was declined.`
                 });
             }
         }
@@ -1173,17 +772,14 @@ const updateOrderStatus = async (req, res) => {
         return res.status(200).json({
             success: true,
             message: `Order #${id} status updated to ${formattedStatus}.`,
-            data: updatedOrder
+            data: result.order
         });
     } catch (error) {
-        await client.query('ROLLBACK');
         console.error('Update status error:', error.message);
         return res.status(500).json({
             success: false,
             message: error.message || 'Internal server error.'
         });
-    } finally {
-        client.release();
     }
 };
 
@@ -1207,199 +803,58 @@ const processOrderPayment = async (req, res) => {
         });
     }
 
-    const formattedMethod = payment_method.toUpperCase();
-
-    if (!['CASH', 'GCASH'].includes(formattedMethod)) {
-        return res.status(400).json({
-            success: false,
-            message: 'Payment method must be CASH or GCASH.'
-        });
-    }
-
-    const formattedDiscountType = (discount_type || 'NONE').toUpperCase();
-    const validDiscounts = ['NONE', 'SENIOR_CITIZEN', 'PWD'];
-
-    if (!validDiscounts.includes(formattedDiscountType)) {
-        return res.status(400).json({
-            success: false,
-            message: 'Invalid discount type. Allowed: NONE, SENIOR_CITIZEN, PWD.'
-        });
-    }
-
-    const client = await pool.connect();
-
     try {
-        await client.query('BEGIN');
+        const paymentResult = await paymentService.processOrderPayment({
+            orderId: Number(id),
+            payment_method,
+            amount_paid,
+            gcash_reference_no,
+            discount_type,
+            customer_name,
+            id_number,
+            cashier_id
+        });
 
-        const orderContextRes = await client.query(
-            'SELECT table_id, session_id FROM orders WHERE id = $1::int',
-            [id]
-        );
+        if (!paymentResult.ok) {
+            const statusCode = paymentResult.error === 'ORDER_NOT_FOUND' ? 404
+                : ['INVALID_PAYMENT_METHOD', 'INVALID_DISCOUNT', 'INVALID_ORDER_STATUS', 'INSUFFICIENT_PAYMENT'].includes(paymentResult.error)
+                    ? 400
+                    : 500;
 
-        if (orderContextRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({
+            return res.status(statusCode).json({
                 success: false,
-                message: 'Order not found.'
+                message: paymentResult.message
             });
         }
 
-        const orderContext = orderContextRes.rows[0];
-        if (orderContext.table_id != null) {
-            await client.query(
-                'SELECT id FROM tables WHERE id = $1::int FOR UPDATE',
-                [orderContext.table_id]
-            );
-        }
-        if (orderContext.session_id != null) {
-            await client.query(
-                'SELECT id FROM table_sessions WHERE id = $1::int FOR UPDATE',
-                [orderContext.session_id]
-            );
-        }
-
-        const orderRes = await client.query(
-            'SELECT * FROM orders WHERE id = $1::int FOR UPDATE',
-            [id]
-        );
-
-        if (orderRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found.'
-            });
-        }
-
-        const order = orderRes.rows[0];
-
-        if (['CANCELLED', 'DECLINED'].includes(order.order_status)) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({
-                success: false,
-                message: `Cannot process payment for an order with status '${order.order_status}'.`
-            });
-        }
-
-        const grossTotal = parseFloat(order.total_amount);
-        const paidAmount = parseFloat(amount_paid);
-
-        const isEligible =
-            formattedDiscountType === 'SENIOR_CITIZEN' ||
-            formattedDiscountType === 'PWD';
-
-        const { netTotal, discount: discountAmount } =
-            computeStatutoryDiscount(grossTotal, isEligible);
-
-        if (paidAmount < netTotal) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({
-                success: false,
-                message: `Insufficient payment. Discounted total is ₱${netTotal.toFixed(2)}, but received ₱${paidAmount.toFixed(2)}.`
-            });
-        }
-
-        const changeAmount = paidAmount - netTotal;
-
-        const paymentInsertQuery = `
-            INSERT INTO payments (
-                order_id, table_id, cashier_id, payment_method,
-                amount_due, amount_paid, change_given, gcash_reference_no,
-                discount_type, discount_amount, sc_pwd_name, sc_pwd_id, status
-            )
-            VALUES ($1::int, $2::int, $3::int, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING *;
-        `;
-
-        const paymentRes = await client.query(paymentInsertQuery, [
-            order.id,
-            order.table_id,
-            cashier_id,
-            formattedMethod,
-            netTotal,
-            paidAmount,
-            changeAmount,
-            gcash_reference_no || null,
-            formattedDiscountType,
-            discountAmount,
-            customer_name || null,
-            id_number || null,
-            'COMPLETED'
-        ]);
-
-        const updatedOrderRes = await client.query(
-            `UPDATE orders 
-             SET order_status = 'COMPLETED', 
-                 total_amount = $1::numeric 
-             WHERE id = $2::int 
-             RETURNING *`,
-            [netTotal, id]
-        );
-        
-        if (order.session_id) {
-            const remainingOrders = await client.query(
-                `SELECT COUNT(*) AS count
-                 FROM orders
-                 WHERE session_id = $1::int
-                   AND id != $2::int
-                   AND (order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW') AND order_status NOT IN ('CANCELLED', 'DECLINED', 'COMPLETED'))`,
-                [order.session_id, id]
-            );
-
-            if (parseInt(remainingOrders.rows[0].count, 10) === 0) {
-                await client.query(
-                    `UPDATE table_sessions
-                     SET session_status = 'CLOSED',
-                         closed_at = CURRENT_TIMESTAMP
-                     WHERE id = $1::int AND UPPER(session_status) IN ('ACTIVE', 'OPEN')`,
-                    [order.session_id]
-                );
-            }
-        }
-
-        await client.query('COMMIT');
-
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('order_paid', {
-                order_id: order.id,
-                table_id: order.table_id,
+        const eventHub = req.app.get('event_hub');
+        if (eventHub) {
+            eventHub.emitOrderPaid({
+                order_id: paymentResult.order.id,
+                table_id: paymentResult.order.table_id,
                 status: 'COMPLETED',
-                message: `Order #${order.id} has been paid and completed.`
+                message: `Order #${paymentResult.order.id} has been paid and completed.`
             });
         }
 
         return res.status(200).json({
             success: true,
-            message: `Order #${id} paid successfully with ${formattedDiscountType} discount applied.`,
+            message: `Order #${id} paid successfully with ${paymentResult.discount_breakdown.discount_type} discount applied.`,
             data: {
-                order: updatedOrderRes.rows[0],
-                payment: paymentRes.rows[0],
-                discount_breakdown: {
-                    gross_total: grossTotal,
-                    discount_type: formattedDiscountType,
-                    discount_applied: discountAmount,
-                    final_amount_due: netTotal,
-                    amount_paid: paidAmount,
-                    change_given: changeAmount,
-                    customer_info: formattedDiscountType !== 'NONE'
-                        ? { customer_name, id_number }
-                        : null
-                }
+                order: paymentResult.order,
+                payment: paymentResult.payment,
+                discount_breakdown: paymentResult.discount_breakdown
             }
         });
-
     } catch (error) {
-        await client.query('ROLLBACK');
         console.error('Payment processing error:', error.message);
         return res.status(500).json({
             success: false,
             message: error.message || 'Internal server error.'
         });
-    } finally {
-        client.release();
     }
 };
+
 
 const getDailySalesReport = async (req, res) => {
     try {
@@ -1517,110 +972,38 @@ const getDailySalesReport = async (req, res) => {
 
 const cancelOrder = async (req, res) => {
     const { id } = req.params;
-    const client = await pool.connect();
 
-    try {
-        await client.query('BEGIN');
+    const result = await orderService.cancelOrder(Number(id));
 
-        const checkResult = await client.query(
-            'SELECT id, table_id, order_status FROM orders WHERE id = $1::int FOR UPDATE',
-            [id]
-        );
-
-        if (checkResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found.'
-            });
-        }
-
-        const currentStatus = checkResult.rows[0].order_status;
-
-        if (currentStatus !== 'PENDING' && currentStatus !== 'NEW') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({
-                success: false,
-                message: `Cannot cancel order. Current status is '${currentStatus}'. Only PENDING or NEW orders can be cancelled directly.`
-            });
-        }
-
-        const itemsResult = await client.query(
-            'SELECT menu_item_id, quantity FROM order_items WHERE order_id = $1::int',
-            [id]
-        );
-
-        for (const item of itemsResult.rows) {
-            const menuItemRes = await client.query(
-                'SELECT stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
-                [item.menu_item_id]
-            );
-
-            if (menuItemRes.rows.length > 0) {
-                const prevStock = menuItemRes.rows[0].stock_quantity ?? 0;
-                const newStock = prevStock + item.quantity;
-                const isAvailable = newStock > 0;
-
-                await client.query(
-                    `UPDATE menu_items 
-                     SET stock_quantity = $1::int, is_available = $2::boolean 
-                     WHERE id = $3::int`,
-                    [newStock, isAvailable, item.menu_item_id]
-                );
-
-                await client.query(
-                    `INSERT INTO inventory_logs (menu_item_id, previous_quantity, new_quantity, adjustment_type, notes)
-                     VALUES ($1::int, $2::int, $3::int, 'ORDER_CANCELLED_RESTOCK', $4)`,
-                    [item.menu_item_id, prevStock, newStock, `Restocked due to Cancellation of Order #${id}`]
-                );
-            }
-        }
-
-        const updateQuery = `
-            UPDATE orders 
-            SET order_status = 'CANCELLED' 
-            WHERE id = $1::int
-            RETURNING id, table_id, order_status, total_amount, created_at;
-        `;
-
-        const { rows } = await client.query(updateQuery, [id]);
-        const cancelledOrder = rows[0];
-
-        await client.query('COMMIT');
-
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('order_cancelled', {
-                order_id: cancelledOrder.id,
-                table_id: cancelledOrder.table_id,
-                status: cancelledOrder.order_status,
-                message: `Order #${cancelledOrder.id} has been cancelled.`
-            });
-
-            io.emit('stock_updated', {
-                order_id: cancelledOrder.id,
-                message: `Stocks refilled after Order #${cancelledOrder.id} cancellation.`
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: `Order #${id} has been successfully cancelled and items were restocked.`,
-            data: cancelledOrder
-        });
-
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Cancel order error:', error.message);
-        return res.status(500).json({
+    if (!result.ok) {
+        const statusCode = result.error === 'ORDER_NOT_FOUND' ? 404 : 400;
+        return res.status(statusCode).json({
             success: false,
-            message: error.message || 'Internal server error.'
+            message: result.message
         });
-    } finally {
-        client.release();
     }
-};
 
+    const eventHub = req.app.get('event_hub');
+    if (eventHub) {
+        eventHub.emitOrderCancelled({
+            order_id: result.order.id,
+            table_id: result.order.table_id,
+            status: result.order.order_status,
+            message: `Order #${result.order.id} has been cancelled.`
+        });
+
+        eventHub.emitStockUpdated({
+            order_id: result.order.id,
+            message: `Stocks refilled after Order #${result.order.id} cancellation.`
+        });
+    }
+
+    return res.status(200).json({
+        success: true,
+        message: `Order #${id} has been successfully cancelled and items were restocked.`,
+        data: result.order
+    });
+};
 const cancelTableSession = async (req, res) => {
     const { session_id } = req.params;
     const client = await pool.connect();
@@ -1662,9 +1045,9 @@ const cancelTableSession = async (req, res) => {
 
         await client.query('COMMIT');
 
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('session_cancelled', {
+        const eventHub = req.app.get('event_hub');
+        if (eventHub) {
+            eventHub.emitSessionCancelled({
                 session_id: session.id,
                 table_id: session.table_id,
                 message: `Table session #${session.id} has been closed and associated active orders cancelled.`
@@ -1761,9 +1144,9 @@ const requestBill = async (req, res) => {
         const grandTotal = parseFloat(summary.grand_total);
         const totalOrders = parseInt(summary.total_orders, 10);
 
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('bill_requested', {
+        const eventHub = req.app.get('event_hub');
+        if (eventHub) {
+            eventHub.emitBillRequested({
                 table_id: tableId,
                 session_id: activeSession.id,
                 bill_requested_at: new Date().toISOString(),
@@ -1846,9 +1229,9 @@ const updateItemStock = async (req, res) => {
 
         await client.query('COMMIT');
 
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('stock_updated', {
+        const eventHub = req.app.get('event_hub');
+        if (eventHub) {
+            eventHub.emitStockUpdated({
                 item_id: id,
                 stock_quantity: newQuantity,
                 is_available: isAvailable,

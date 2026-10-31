@@ -4,7 +4,7 @@ const pool = require('./db');
  * Background worker para i-auto-close ang mga table session
  * na walang aktibidad (AFK) sa loob ng 5 minuto.
  */
-const startAutoCloseMonitor = (io) => {
+const startAutoCloseMonitor = (eventHub) => {
     // Tatakbo kada 1 minuto (60000 ms) para i-check ang mga inactive sessions
     setInterval(async () => {
         try {
@@ -23,9 +23,9 @@ const startAutoCloseMonitor = (io) => {
                 console.log(`🧹 [AutoClose] Na-close ang ${rows.length} na table session dahil sa 5-minutong AFK.`);
 
                 // Opsyonal: Mag-broadcast gamit ang Socket.io kung nais mong ma-update ang UI ng cashier/waiter
-                if (io) {
+                if (eventHub) {
                     rows.forEach(session => {
-                        io.emit('table_session_closed', {
+                        eventHub.emitTableSessionClosed({
                             session_id: session.id,
                             table_id: session.table_id,
                             reason: 'AFK Timeout (5 minutes)'
