@@ -26,7 +26,15 @@ class EventHub extends EventEmitter {
         const socketEvent = SOCKET_EVENT_MAP[domainEvent] || domainEvent;
         this.emit(domainEvent, payload);
         if (this.io) {
-            this.io.emit(socketEvent, payload);
+            // Targeted emission: ipadala lamang sa room ng tamang table para
+            // hindi mag-abot sa ibang customers at hindi maging 'blind spot'
+            // ang mga naka-join sa table room.
+            const roomName = payload && payload.table_id != null ? 'table_' + payload.table_id : null;
+            if (roomName) {
+                this.io.to(roomName).emit(socketEvent, payload);
+            } else {
+                this.io.emit(socketEvent, payload);
+            }
         }
         return payload;
     }
