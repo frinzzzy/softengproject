@@ -25,17 +25,43 @@ class EventHub extends EventEmitter {
     _publish(domainEvent, payload) {
         const socketEvent = SOCKET_EVENT_MAP[domainEvent] || domainEvent;
         this.emit(domainEvent, payload);
-        if (this.io) {
-            // Targeted emission: ipadala lamang sa room ng tamang table para
-            // hindi mag-abot sa ibang customers at hindi maging 'blind spot'
-            // ang mga naka-join sa table room.
-            const roomName = payload && payload.table_id != null ? 'table_' + payload.table_id : null;
-            if (roomName) {
-                this.io.to(roomName).emit(socketEvent, payload);
-            } else {
-                this.io.emit(socketEvent, payload);
-            }
+        if (!this.io) return payload;
+
+        // Stock updates ay catalog-wide: kailangan makita ng LAHAT ng tables
+        // para updated ang menu availability. Huwag i-scope sa isang table.
+        if (domainEvent === 'stock.updated') {
+            this.io.emit(socketEvent, payload);
+            return payload;
         }
+
+        const data = (payload && payload.order) || payload || {};
+        const tableId = data.table_id != null ? data.table_id : (payload && payload.table_id);
+        const sessionId = data.session_id != null ? data.session_id : (payload && payload.session_id);
+        const orderId = data.order_id != null ? data.order_id
+            : (data.id != null ? data.id
+                : (payload ? (payload.order_id != null ? payload.order_id : payload.id) : null));
+
+        const hasTable = tableId !== null && tableId !== undefined && tableId !== '';
+        const hasSession = sessionId !== null && sessionId !== undefined && sessionId !== '';
+        const hasOrder = orderId !== null && orderId !== undefined && orderId !== '';
+
+        // Walang specific identifier -> global fallback.
+        if (!hasTable && !hasSession && !hasOrder) {
+            this.io.emit(socketEvent, payload);
+            return payload;
+        }
+
+        // Admin at kitchen monitoring ay laging kasama.
+        // MAHALAGA: isang chained emit lang (io.to(a).to(b).emit) para hindi
+        // doble ang dating sa socket na naka-join sa maraming room — dedupe
+        // ang union ng rooms sa isang emit ng socket.io.
+        let emitter = this.io.to('admin_live_monitoring').to('kitchen_monitoring');
+
+        if (hasTable) emitter = emitter.to('table_' + tableId);
+        if (hasSession) emitter = emitter.to('session_' + sessionId);
+        if (hasOrder) emitter = emitter.to('order_' + orderId).to(orderId.toString());
+
+        emitter.emit(socketEvent, payload);
         return payload;
     }
 
