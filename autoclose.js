@@ -28,6 +28,7 @@ const startAutoCloseMonitor = (eventHub) => {
                         eventHub.emitTableSessionClosed({
                             session_id: session.id,
                             table_id: session.table_id,
+                            status: 'AFK',
                             reason: 'AFK Timeout (5 minutes)'
                         });
                     });

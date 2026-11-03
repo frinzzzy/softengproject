@@ -197,6 +197,8 @@ const getUnfinishedOrders = async (req, res) => {
                 o.id,
                 o.session_id,
                 o.table_id,
+                o.parent_order_id,
+                COALESCE(o.is_additional_order, FALSE) AS is_additional_order,
                 COALESCE(t.table_number, o.table_id) AS table_number,
                 o.total_amount,
                 o.order_status,
@@ -556,6 +558,78 @@ const getCustomerLiveOrders = async (req, res) => {
     }
 };
 
+/// Phase C: Pinagkasong order history ng customer session — kabilang ang
+/// COMPLETED/PAID na orders para hindi mawala ang notification/history kapag
+/// nag-settle na ang session (dahil ang /unfinished ay itinatapon na ang COMPLETED).
+const getRecentCustomerOrders = async (req, res) => {
+    const { session_id } = req.query;
+
+    const sessionIdNum = Number(session_id);
+    if (!Number.isSafeInteger(sessionIdNum) || sessionIdNum <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid session_id is required.'
+        });
+    }
+
+    try {
+        const query = `
+            SELECT 
+                o.id AS order_id,
+                o.id,
+                o.session_id,
+                o.table_id,
+                o.parent_order_id,
+                COALESCE(o.is_additional_order, FALSE) AS is_additional_order,
+                CASE
+                    WHEN COALESCE(o.is_additional_order, FALSE) OR o.parent_order_id IS NOT NULL
+                    THEN 'ADDITIONAL'
+                    ELSE 'NEW'
+                END AS order_type,
+                COALESCE(t.table_number, o.table_id) AS table_number,
+                o.total_amount,
+                o.order_status,
+                o.decline_reason,
+                o.created_at,
+                COALESCE(
+                    JSON_AGG(
+                        JSON_BUILD_OBJECT(
+                            'id', oi.id,
+                            'item_id', oi.menu_item_id,
+                            'name', COALESCE(m.name, 'Item #' || oi.menu_item_id),
+                            'item_name', COALESCE(m.name, 'Item #' || oi.menu_item_id),
+                            'quantity', oi.quantity,
+                            'unit_price', oi.unit_price
+                        )
+                    ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
+                ) AS items
+            FROM orders o
+            LEFT JOIN tables t ON o.table_id = t.id
+            LEFT JOIN order_items oi ON o.id = oi.order_id
+            LEFT JOIN menu_items m ON oi.menu_item_id = m.id
+            WHERE o.session_id = $1::int
+            GROUP BY o.id, t.table_number
+            ORDER BY o.created_at DESC
+            LIMIT 20;
+        `;
+
+        const { rows } = await pool.query(query, [sessionIdNum]);
+
+        return res.status(200).json({
+            success: true,
+            count: rows.length,
+            data: rows,
+            message: 'Recent customer orders retrieved successfully.'
+        });
+    } catch (error) {
+        console.error('Fetch recent customer orders error:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: error.message || 'Failed to fetch recent customer orders.'
+        });
+    }
+};
+
 const getSessionOrder = async (req, res) => {
     const sessionId = Number(req.params.session_id);
     const orderId = Number(req.params.order_id);
@@ -757,8 +831,12 @@ const updateOrderStatus = async (req, res) => {
                 order_id: result.order.id,
                 session_id: result.order.session_id,
                 table_id: result.order.table_id,
+                parent_order_id: result.order.parent_order_id ?? null,
+                is_additional_order: result.order.is_additional_order ?? null,
                 status: result.order.order_status,
                 decline_reason: result.order.decline_reason,
+                event_type: 'status',
+                status_changed_at: new Date().toISOString(),
                 message: `Order #${result.order.id} status is now ${result.order.order_status}`
             });
 
@@ -813,7 +891,8 @@ const processOrderPayment = async (req, res) => {
             discount_type,
             customer_name,
             id_number,
-            cashier_id
+            cashier_id,
+            eventHub
         });
 
         if (!paymentResult.ok) {
@@ -834,7 +913,11 @@ const processOrderPayment = async (req, res) => {
                 order_id: paymentResult.order.id,
                 session_id: paymentResult.order.session_id,
                 table_id: paymentResult.order.table_id,
+                parent_order_id: paymentResult.order.parent_order_id ?? null,
+                is_additional_order: paymentResult.order.is_additional_order ?? null,
                 status: 'COMPLETED',
+                event_type: 'paid',
+                status_changed_at: new Date().toISOString(),
                 message: `Order #${paymentResult.order.id} has been paid and completed.`
             });
         }
@@ -991,7 +1074,11 @@ const cancelOrder = async (req, res) => {
             order_id: result.order.id,
             session_id: result.order.session_id,
             table_id: result.order.table_id,
+            parent_order_id: result.order.parent_order_id ?? null,
+            is_additional_order: result.order.is_additional_order ?? null,
             status: result.order.order_status,
+            event_type: 'cancelled',
+            status_changed_at: new Date().toISOString(),
             message: `Order #${result.order.id} has been cancelled.`
         });
 
@@ -1053,6 +1140,9 @@ const cancelTableSession = async (req, res) => {
             eventHub.emitSessionCancelled({
                 session_id: session.id,
                 table_id: session.table_id,
+                status: 'CANCELLED',
+                event_type: 'session_cancelled',
+                status_changed_at: new Date().toISOString(),
                 message: `Table session #${session.id} has been closed and associated active orders cancelled.`
             });
         }
@@ -1263,6 +1353,7 @@ module.exports = {
     getTableSessionBill,
     getOrders,
     getCustomerLiveOrders,
+    getRecentCustomerOrders,
     getSessionOrder,
     getSessionOrdersSummary,
     updateOrderStatus,

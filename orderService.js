@@ -9,7 +9,7 @@ const updateOrderStatus = async (orderId, status, declineReason) => {
         await client.query('BEGIN');
 
         const checkResult = await client.query(
-            'SELECT id, table_id, order_status, decline_reason FROM orders WHERE id = $1::int FOR UPDATE',
+            'SELECT id, table_id, session_id, parent_order_id, is_additional_order, order_status, decline_reason FROM orders WHERE id = $1::int FOR UPDATE',
             [orderId]
         );
 
@@ -31,7 +31,7 @@ const updateOrderStatus = async (orderId, status, declineReason) => {
             SET order_status = $1,
                 decline_reason = $2
             WHERE id = $3::int
-            RETURNING id, table_id, order_status, decline_reason, total_amount, created_at;
+            RETURNING id, table_id, session_id, parent_order_id, is_additional_order, order_status, decline_reason, total_amount, created_at;
         `;
 
         const { rows } = await client.query(updateQuery, [
@@ -64,7 +64,7 @@ const cancelOrder = async (orderId) => {
         await client.query('BEGIN');
 
         const checkResult = await client.query(
-            'SELECT id, table_id, order_status FROM orders WHERE id = $1::int FOR UPDATE',
+            'SELECT id, table_id, session_id, parent_order_id, is_additional_order, order_status FROM orders WHERE id = $1::int FOR UPDATE',
             [orderId]
         );
 
@@ -86,7 +86,7 @@ const cancelOrder = async (orderId) => {
             UPDATE orders 
             SET order_status = 'CANCELLED' 
             WHERE id = $1::int
-            RETURNING id, table_id, order_status, total_amount, created_at;
+            RETURNING id, table_id, session_id, parent_order_id, is_additional_order, order_status, total_amount, created_at;
         `;
 
         const { rows } = await client.query(updateQuery, [orderId]);

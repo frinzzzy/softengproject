@@ -23,7 +23,8 @@ const processOrderPayment = async ({
     discount_type = 'NONE',
     customer_name,
     id_number,
-    cashier_id
+    cashier_id,
+    eventHub = null
 }) => {
     const formattedMethod = payment_method.toUpperCase();
     const formattedDiscountType = (discount_type || 'NONE').toUpperCase();
@@ -151,6 +152,18 @@ const processOrderPayment = async ({
                      WHERE id = $1::int AND UPPER(session_status) IN ('ACTIVE', 'OPEN')`,
                     [order.session_id]
                 );
+
+                // Phase C: emit session-close event (para sa accurate session-closed UX sa customer app).
+                if (eventHub) {
+                    eventHub.emitTableSessionClosed({
+                        session_id: order.session_id,
+                        table_id: order.table_id,
+                        status: 'COMPLETED',
+                        event_type: 'session_closed',
+                        status_changed_at: new Date().toISOString(),
+                        message: `Order #${orderId} settled. Table session #${order.session_id} closed.`
+                    });
+                }
             }
         }
 

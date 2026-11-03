@@ -33,6 +33,7 @@ const {
   getTableSessionBill,
   getOrders, 
   getCustomerLiveOrders,
+  getRecentCustomerOrders,
   getSessionOrder,
   getSessionOrdersSummary,
   updateOrderStatus, 
@@ -374,6 +375,7 @@ app.get('/api/v1/orders/:id', getOrderById);
 app.get('/api/v1/orders', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'), getOrders);
 
 app.get('/api/v1/customer/orders/live', getCustomerLiveOrders);
+app.get('/api/v1/customer/orders/recent', getRecentCustomerOrders);
 
 app.get('/api/v1/customer/sessions/:session_id/orders/:order_id', authenticateSessionToken, touchAuthenticatedSession, getSessionOrder);
 app.get('/api/v1/customer/sessions/:session_id/orders-summary', authenticateSessionToken, touchAuthenticatedSession, getSessionOrdersSummary);
