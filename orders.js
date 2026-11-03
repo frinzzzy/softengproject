@@ -755,6 +755,7 @@ const updateOrderStatus = async (req, res) => {
         if (eventHub) {
             eventHub.emitOrderStatusUpdated({
                 order_id: result.order.id,
+                session_id: result.order.session_id,
                 table_id: result.order.table_id,
                 status: result.order.order_status,
                 decline_reason: result.order.decline_reason,
@@ -831,6 +832,7 @@ const processOrderPayment = async (req, res) => {
         if (eventHub) {
             eventHub.emitOrderPaid({
                 order_id: paymentResult.order.id,
+                session_id: paymentResult.order.session_id,
                 table_id: paymentResult.order.table_id,
                 status: 'COMPLETED',
                 message: `Order #${paymentResult.order.id} has been paid and completed.`
@@ -987,6 +989,7 @@ const cancelOrder = async (req, res) => {
     if (eventHub) {
         eventHub.emitOrderCancelled({
             order_id: result.order.id,
+            session_id: result.order.session_id,
             table_id: result.order.table_id,
             status: result.order.order_status,
             message: `Order #${result.order.id} has been cancelled.`
