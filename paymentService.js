@@ -155,14 +155,19 @@ const processOrderPayment = async ({
 
                 // Phase C: emit session-close event (para sa accurate session-closed UX sa customer app).
                 if (eventHub) {
-                    eventHub.emitTableSessionClosed({
-                        session_id: order.session_id,
-                        table_id: order.table_id,
-                        status: 'COMPLETED',
-                        event_type: 'session_closed',
-                        status_changed_at: new Date().toISOString(),
-                        message: `Order #${orderId} settled. Table session #${order.session_id} closed.`
-                    });
+                    try {
+                        eventHub.emitTableSessionClosed({
+                            session_id: order.session_id,
+                            table_id: order.table_id,
+                            status: 'COMPLETED',
+                            event_type: 'session_closed',
+                            status_changed_at: new Date().toISOString(),
+                            message: `Order #${orderId} settled. Table session #${order.session_id} closed.`
+                        });
+                    } catch (emitError) {
+                        // Iwasang bumagsak ang payment flow dahil sa event emit failure.
+                        console.error('⚠️ [Payment] Failed to emit table_session_closed event:', emitError?.message);
+                    }
                 }
             }
         }
@@ -189,6 +194,7 @@ const processOrderPayment = async ({
         } catch (rollbackError) {
             console.error('Payment rollback error:', rollbackError.message);
         }
+        console.error('❌ Payment processing error stack:', error?.stack || error);
         throw error;
     } finally {
         client.release();

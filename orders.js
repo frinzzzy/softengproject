@@ -827,18 +827,22 @@ const updateOrderStatus = async (req, res) => {
 
         const eventHub = req.app.get('event_hub');
         if (eventHub) {
-            eventHub.emitOrderStatusUpdated({
-                order_id: result.order.id,
-                session_id: result.order.session_id,
-                table_id: result.order.table_id,
-                parent_order_id: result.order.parent_order_id ?? null,
-                is_additional_order: result.order.is_additional_order ?? null,
-                status: result.order.order_status,
-                decline_reason: result.order.decline_reason,
-                event_type: 'status',
-                status_changed_at: new Date().toISOString(),
-                message: `Order #${result.order.id} status is now ${result.order.order_status}`
-            });
+            try {
+                eventHub.emitOrderStatusUpdated({
+                    order_id: result.order.id,
+                    session_id: result.order.session_id,
+                    table_id: result.order.table_id,
+                    parent_order_id: result.order.parent_order_id ?? null,
+                    is_additional_order: result.order.is_additional_order ?? null,
+                    status: result.order.order_status,
+                    decline_reason: result.order.decline_reason,
+                    event_type: 'status',
+                    status_changed_at: new Date().toISOString(),
+                    message: `Order #${result.order.id} status is now ${result.order.order_status}`
+                });
+            } catch (emitError) {
+                console.error('⚠️ [OrderStatus] Failed to emit order.status.updated event:', emitError?.message);
+            }
 
             if (result.shouldRestock) {
                 eventHub.emitStockUpdated({
@@ -909,17 +913,21 @@ const processOrderPayment = async (req, res) => {
 
         const eventHub = req.app.get('event_hub');
         if (eventHub) {
-            eventHub.emitOrderPaid({
-                order_id: paymentResult.order.id,
-                session_id: paymentResult.order.session_id,
-                table_id: paymentResult.order.table_id,
-                parent_order_id: paymentResult.order.parent_order_id ?? null,
-                is_additional_order: paymentResult.order.is_additional_order ?? null,
-                status: 'COMPLETED',
-                event_type: 'paid',
-                status_changed_at: new Date().toISOString(),
-                message: `Order #${paymentResult.order.id} has been paid and completed.`
-            });
+            try {
+                eventHub.emitOrderPaid({
+                    order_id: paymentResult.order.id,
+                    session_id: paymentResult.order.session_id,
+                    table_id: paymentResult.order.table_id,
+                    parent_order_id: paymentResult.order.parent_order_id ?? null,
+                    is_additional_order: paymentResult.order.is_additional_order ?? null,
+                    status: 'COMPLETED',
+                    event_type: 'paid',
+                    status_changed_at: new Date().toISOString(),
+                    message: `Order #${paymentResult.order.id} has been paid and completed.`
+                });
+            } catch (emitError) {
+                console.error('⚠️ [Payment] Failed to emit order.paid event:', emitError?.message);
+            }
         }
 
         return res.status(200).json({
@@ -933,6 +941,7 @@ const processOrderPayment = async (req, res) => {
         });
     } catch (error) {
         console.error('Payment processing error:', error.message);
+        console.error('❌ Payment processing error stack:', error?.stack || error);
         return res.status(500).json({
             success: false,
             message: error.message || 'Internal server error.'
