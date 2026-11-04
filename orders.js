@@ -815,6 +815,8 @@ const updateOrderStatus = async (req, res) => {
         });
     }
 
+    const eventHub = req.app.get('event_hub');
+
     try {
         const result = await orderService.updateOrderStatus(Number(id), formattedStatus, decline_reason);
 
@@ -825,7 +827,6 @@ const updateOrderStatus = async (req, res) => {
             });
         }
 
-        const eventHub = req.app.get('event_hub');
         if (eventHub) {
             try {
                 eventHub.emitOrderStatusUpdated({
@@ -886,6 +887,8 @@ const processOrderPayment = async (req, res) => {
         });
     }
 
+    const eventHub = req.app.get('event_hub');
+
     try {
         const paymentResult = await paymentService.processOrderPayment({
             orderId: Number(id),
@@ -911,7 +914,6 @@ const processOrderPayment = async (req, res) => {
             });
         }
 
-        const eventHub = req.app.get('event_hub');
         if (eventHub) {
             try {
                 eventHub.emitOrderPaid({
@@ -1107,6 +1109,8 @@ const cancelTableSession = async (req, res) => {
     const { session_id } = req.params;
     const client = await pool.connect();
 
+    const eventHub = req.app.get('event_hub');
+
     try {
         await client.query('BEGIN');
 
@@ -1144,7 +1148,6 @@ const cancelTableSession = async (req, res) => {
 
         await client.query('COMMIT');
 
-        const eventHub = req.app.get('event_hub');
         if (eventHub) {
             eventHub.emitSessionCancelled({
                 session_id: session.id,
@@ -1189,6 +1192,8 @@ const requestBill = async (req, res) => {
             message: 'A valid session_id or table_id is required to request bill.'
         });
     }
+
+    const eventHub = req.app.get('event_hub');
 
     try {
         const activeSessionQuery = sessionId !== null
@@ -1246,7 +1251,6 @@ const requestBill = async (req, res) => {
         const grandTotal = parseFloat(summary.grand_total);
         const totalOrders = parseInt(summary.total_orders, 10);
 
-        const eventHub = req.app.get('event_hub');
         if (eventHub) {
             eventHub.emitBillRequested({
                 table_id: tableId,
@@ -1297,6 +1301,8 @@ const updateItemStock = async (req, res) => {
     }
 
     const client = await pool.connect();
+    const eventHub = req.app.get('event_hub');
+
     try {
         await client.query('BEGIN');
 
@@ -1331,7 +1337,6 @@ const updateItemStock = async (req, res) => {
 
         await client.query('COMMIT');
 
-        const eventHub = req.app.get('event_hub');
         if (eventHub) {
             eventHub.emitStockUpdated({
                 item_id: id,
