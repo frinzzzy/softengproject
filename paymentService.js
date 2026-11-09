@@ -148,7 +148,8 @@ const processOrderPayment = async ({
                 await client.query(
                     `UPDATE table_sessions
                      SET session_status = 'CLOSED', 
-                         closed_at = CURRENT_TIMESTAMP 
+                         closed_at = CURRENT_TIMESTAMP,
+                         bill_requested_at = NULL
                      WHERE id = $1::int AND UPPER(session_status) IN ('ACTIVE', 'OPEN')`,
                     [order.session_id]
                 );

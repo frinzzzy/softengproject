@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const inventoryService = require('./inventoryService');
 const orderService = require('./orderService');
 const paymentService = require('./paymentService');
+const notificationService = require('./notificationService');
 
 const logApiResponse = (endpoint, details) => {
     if (process.env.DEBUG_API_RESPONSES === 'true') {
@@ -256,7 +257,7 @@ const getTableSessionBill = async (req, res) => {
                 ts.id AS session_id,
                 t.id AS table_id,
                 t.table_number,
-                COALESCE(ts.session_status, 'ACTIVE') AS session_status,
+                COALESCE(ts.session_status, 'CLOSED') AS session_status,
                 COALESCE(ts.bill_requested_at, NULL) AS bill_requested_at,
                 COALESCE(SUM(o.total_amount), 0) AS grand_total,
                 COALESCE(
@@ -402,7 +403,12 @@ const getOrders = async (req, res) => {
                         )
                     ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
                 ) AS items,
-                ts.bill_requested_at AS bill_requested_at
+                CASE
+                    WHEN UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
+                     AND UPPER(o.order_status) NOT IN ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED')
+                    THEN ts.bill_requested_at
+                    ELSE NULL
+                END AS bill_requested_at
             FROM orders o
             LEFT JOIN tables t ON o.table_id = t.id
             LEFT JOIN table_sessions ts ON o.session_id = ts.id
@@ -434,7 +440,7 @@ const getOrders = async (req, res) => {
             query += ` WHERE ` + conditions.join(' AND ');
         }
 
-        query += ` GROUP BY o.id, t.table_number, ts.bill_requested_at ORDER BY o.created_at DESC;`;
+        query += ` GROUP BY o.id, t.table_number, ts.session_status, ts.bill_requested_at ORDER BY o.created_at DESC;`;
 
         const { rows } = await pool.query(query, values);
 
@@ -508,9 +514,13 @@ const getCustomerLiveOrders = async (req, res) => {
                             )
                         )
                     ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
-                ) AS items
+                ) AS items,
+                ts.bill_requested_at AS bill_requested_at
             FROM orders o
             LEFT JOIN tables t ON o.table_id = t.id
+            LEFT JOIN table_sessions ts
+                ON o.session_id = ts.id
+               AND UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
             LEFT JOIN order_items oi ON o.id = oi.order_id
             LEFT JOIN menu_items m ON oi.menu_item_id = m.id
         `;
@@ -539,7 +549,7 @@ const getCustomerLiveOrders = async (req, res) => {
             query += ` WHERE ` + conditions.join(' AND ');
         }
 
-        query += ` GROUP BY o.id, t.table_number ORDER BY o.created_at DESC;`;
+        query += ` GROUP BY o.id, t.table_number, ts.bill_requested_at ORDER BY o.created_at DESC;`;
 
         const { rows } = await pool.query(query, values);
 
@@ -853,6 +863,22 @@ const updateOrderStatus = async (req, res) => {
             }
         }
 
+        if (result.previousStatus !== result.order.order_status) {
+            try {
+                const pushResult = await notificationService.sendOrderStatusNotification({
+                    session_id: result.order.session_id,
+                    table_id: result.order.table_id,
+                    order_id: result.order.id,
+                    status: result.order.order_status
+                });
+                if (pushResult.sent > 0) {
+                    console.log(`[FCM] Push sent for Order #${result.order.id} (${result.order.order_status})`);
+                }
+            } catch (pushError) {
+                console.error('[FCM] Failed to send order status notification:', pushError.message);
+            }
+        }
+
         return res.status(200).json({
             success: true,
             message: `Order #${id} status updated to ${formattedStatus}.`,
@@ -1140,7 +1166,8 @@ const cancelTableSession = async (req, res) => {
         const updatedSessionResult = await client.query(
             `UPDATE table_sessions 
              SET session_status = 'CLOSED', 
-                 closed_at = CURRENT_TIMESTAMP 
+                 closed_at = CURRENT_TIMESTAMP,
+                 bill_requested_at = NULL
              WHERE id = $1::int
              RETURNING *`,
             [session_id]
@@ -1157,6 +1184,15 @@ const cancelTableSession = async (req, res) => {
                 status_changed_at: new Date().toISOString(),
                 message: `Table session #${session.id} has been closed and associated active orders cancelled.`
             });
+        }
+
+        try {
+            await pool.query(
+                'DELETE FROM customer_fcm_tokens WHERE session_id = $1::int',
+                [session.id]
+            );
+        } catch (fcmCleanupError) {
+            console.error('[FCM] Failed to remove tokens for closed session:', fcmCleanupError.message);
         }
 
         return res.status(200).json({
@@ -1180,7 +1216,7 @@ const cancelTableSession = async (req, res) => {
 const requestBill = async (req, res) => {
     const body = req.body || {};
     const rawSessionId = req.params.session_id ?? body.session_id ?? null;
-    const rawTableId = body.table_id ?? null;
+    const rawTableId = req.params.table_id ?? body.table_id ?? null;
     const sessionId = rawSessionId == null ? null : Number(rawSessionId);
     const requestedTableId = rawTableId == null ? null : Number(rawTableId);
 
@@ -1194,15 +1230,18 @@ const requestBill = async (req, res) => {
     }
 
     const eventHub = req.app.get('event_hub');
+    const client = await pool.connect();
 
     try {
+        await client.query('BEGIN');
+
         const activeSessionQuery = sessionId !== null
-            ? `SELECT id, table_id
+            ? `SELECT id, table_id, bill_requested_at
                FROM table_sessions
                WHERE id = $1::int
                  AND UPPER(session_status) IN ('ACTIVE', 'OPEN')
                  ${requestedTableId !== null ? 'AND table_id = $2::int' : ''}`
-            : `SELECT id, table_id
+            : `SELECT id, table_id, bill_requested_at
                FROM table_sessions
                WHERE table_id = $1::int
                  AND UPPER(session_status) IN ('ACTIVE', 'OPEN')
@@ -1212,9 +1251,10 @@ const requestBill = async (req, res) => {
         const params = sessionId !== null
             ? (requestedTableId !== null ? [sessionId, requestedTableId] : [sessionId])
             : [requestedTableId];
-        const sessionRes = await pool.query(activeSessionQuery, params);
+        const sessionRes = await client.query(`${activeSessionQuery} FOR UPDATE`, params);
 
         if (sessionRes.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({
                 success: false,
                 message: 'No active session found for this session or table.'
@@ -1223,18 +1263,36 @@ const requestBill = async (req, res) => {
 
         const activeSession = sessionRes.rows[0];
         const tableId = Number(activeSession.table_id);
-
-        // I-update ang table session para ma-record ang bill request activity
-        // (session-level state; hindi natin binabago ang core order_status para
-        //  hindi masira ang kitchen/cashier workflows)
-        await pool.query(
-            `UPDATE table_sessions
-             SET last_active_at = CURRENT_TIMESTAMP,
-                 bill_requested_at = CURRENT_TIMESTAMP
-             WHERE id = $1::int
-               AND UPPER(session_status) IN ('ACTIVE', 'OPEN')`,
+        const previousRequestedAt = activeSession.bill_requested_at;
+        const newOrderRes = await client.query(
+            `SELECT EXISTS (
+                 SELECT 1
+                 FROM orders
+                 WHERE session_id = $1::int
+                   AND UPPER(order_status) IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW')
+                   AND created_at > (
+                       SELECT bill_requested_at
+                       FROM table_sessions
+                       WHERE id = $1::int
+                   )
+             ) AS has_new_order`,
             [activeSession.id]
         );
+        const alreadyRequested = previousRequestedAt != null && !newOrderRes.rows[0].has_new_order;
+
+        let billRequestedAt = previousRequestedAt;
+        if (!alreadyRequested) {
+            const updatedSession = await client.query(
+                `UPDATE table_sessions
+                 SET last_active_at = clock_timestamp(),
+                     bill_requested_at = clock_timestamp()
+                 WHERE id = $1::int
+                   AND UPPER(session_status) IN ('ACTIVE', 'OPEN')
+                 RETURNING bill_requested_at`,
+                [activeSession.id]
+            );
+            billRequestedAt = updatedSession.rows[0].bill_requested_at;
+        }
 
         const billSummaryQuery = `
             SELECT 
@@ -1242,26 +1300,31 @@ const requestBill = async (req, res) => {
                 COALESCE(SUM(o.total_amount), 0) AS grand_total
             FROM orders o
             WHERE o.session_id = $1::int
-              AND (o.order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW') AND o.order_status NOT IN ('CANCELLED', 'DECLINED', 'COMPLETED'));
+              AND o.order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW');
         `;
 
-        const billSummaryRes = await pool.query(billSummaryQuery, [activeSession.id]);
+        const billSummaryRes = await client.query(billSummaryQuery, [activeSession.id]);
         const summary = billSummaryRes.rows[0];
 
         const grandTotal = parseFloat(summary.grand_total);
         const totalOrders = parseInt(summary.total_orders, 10);
+        await client.query('COMMIT');
 
-        if (eventHub) {
-            eventHub.emitBillRequested({
-                table_id: tableId,
-                session_id: activeSession.id,
-                bill_requested_at: new Date().toISOString(),
-                bill_status: 'REQUESTED',
-                total_orders: totalOrders,
-                grand_total: grandTotal,
-                requested_at: new Date().toISOString(),
-                message: `Table #${tableId} requested bill out. Total: ₱${grandTotal.toFixed(2)}`
-            });
+        if (!alreadyRequested && eventHub) {
+            try {
+                eventHub.emitBillRequested({
+                    table_id: tableId,
+                    session_id: activeSession.id,
+                    bill_requested_at: billRequestedAt,
+                    bill_status: 'REQUESTED',
+                    total_orders: totalOrders,
+                    grand_total: grandTotal,
+                    requested_at: billRequestedAt,
+                    message: `Table #${tableId} requested bill out. Total: ₱${grandTotal.toFixed(2)}`
+                });
+            } catch (emitError) {
+                console.error('Bill request event emit error:', emitError.message);
+            }
         }
 
         const responseData = {
@@ -1269,22 +1332,32 @@ const requestBill = async (req, res) => {
             session_id: activeSession.id,
             total_orders: totalOrders,
             grand_total: grandTotal.toFixed(2),
-            bill_requested_at: new Date().toISOString(),
-            bill_status: 'REQUESTED'
+            bill_requested_at: billRequestedAt,
+            bill_status: 'REQUESTED',
+            already_requested: alreadyRequested
         };
 
         return res.status(200).json({
             success: true,
-            message: `Bill request sent successfully for Table #${tableId}.`,
+            message: alreadyRequested
+                ? `Bill has already been requested for Table #${tableId}.`
+                : `Bill request sent successfully for Table #${tableId}.`,
             data: responseData
         });
 
     } catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Bill request rollback error:', rollbackError.message);
+        }
         console.error('Request bill error:', error.message);
         return res.status(500).json({
             success: false,
             message: error.message || 'Failed to process bill request.'
         });
+    } finally {
+        client.release();
     }
 };
 

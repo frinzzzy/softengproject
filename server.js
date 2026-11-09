@@ -18,6 +18,7 @@ const assistanceRoutes = require('./assistance');
 const { startAutoCloseMonitor } = require('./autoclose');
 
 const eventHub = require('./eventHub');
+const notificationService = require('./notificationService');
 
 const { 
   createEventReservation, 
@@ -370,8 +371,8 @@ app.post('/api/v1/dev/force-active-session', async (req, res) => {
 app.post('/api/v1/orders', createOrder);
 app.get('/api/v1/orders/unfinished', getUnfinishedOrders);
 app.get('/api/v1/orders/:id', getOrderById);
-// TEMP DISABLED (Bill Request feature on hold)
-// app.get('/api/v1/tables/:table_id/bill', touchSessionFromToken, getTableSessionBill);
+app.get('/api/v1/tables/:table_id/bill', getTableSessionBill);
+app.post('/api/v1/tables/:table_id/bill', touchSessionFromToken, requestBill);
 app.get('/api/v1/orders', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'), getOrders);
 
 app.get('/api/v1/customer/orders/live', getCustomerLiveOrders);
@@ -379,10 +380,17 @@ app.get('/api/v1/customer/orders/recent', getRecentCustomerOrders);
 
 app.get('/api/v1/customer/sessions/:session_id/orders/:order_id', authenticateSessionToken, touchAuthenticatedSession, getSessionOrder);
 app.get('/api/v1/customer/sessions/:session_id/orders-summary', authenticateSessionToken, touchAuthenticatedSession, getSessionOrdersSummary);
+app.post('/api/v1/customer/sessions/:session_id/bill', authenticateSessionToken, touchAuthenticatedSession, requestBill);
 app.post('/api/v1/customer/sessions/:session_id/activity', authenticateSessionToken, touchAuthenticatedSession, (req, res) => {
   const sessionId = Number(req.params.session_id);
   return res.status(200).json({ success: true, session_id: sessionId });
 });
+app.post(
+  '/api/v1/customer/sessions/:session_id/fcm-token',
+  authenticateSessionToken,
+  touchAuthenticatedSession,
+  notificationService.registerFcmToken
+);
 app.patch('/api/v1/orders/:id/status', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN'), updateOrderStatus);
 app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'CASHIER', 'WAITER'), processOrderPayment);
 app.get('/api/v1/reports/daily-sales', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), getDailySalesReport);
@@ -561,10 +569,6 @@ app.get('/api/v1/categories', async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch categories.' });
   }
 });
-
-// TEMP DISABLED (Bill Request feature on hold)
-// app.get('/api/v1/customer/sessions/:session_id/bill', touchSessionFromToken, requestBill);
-// app.get('/api/v1/tables/:table_id/bill', touchSessionFromToken, getTableSessionBill);
 
 app.post('/api/v1/tables/generate-qr', authenticateToken, authorizeRoles('ADMIN', 'WAITER'), async (req, res) => {
   const { table_id } = req.body;

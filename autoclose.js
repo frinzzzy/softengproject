@@ -11,7 +11,9 @@ const startAutoCloseMonitor = (eventHub) => {
             // Kunin at i-close ang mga sessions na lumampas na sa 5 minuto ang inactivities
             const query = `
                 UPDATE table_sessions 
-                SET session_status = 'CLOSED', closed_at = CURRENT_TIMESTAMP 
+                SET session_status = 'CLOSED',
+                    closed_at = CURRENT_TIMESTAMP,
+                    bill_requested_at = NULL
                 WHERE session_status = 'ACTIVE' 
                 AND last_active_at < CURRENT_TIMESTAMP - INTERVAL '5 minutes'
                 RETURNING id, table_id;
@@ -42,5 +44,4 @@ const startAutoCloseMonitor = (eventHub) => {
 
 
 module.exports = { startAutoCloseMonitor };
-
 
