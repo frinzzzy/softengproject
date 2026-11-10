@@ -190,6 +190,10 @@ const touchTableSession = async (sessionId, tableId) => {
   return rows.length > 0;
 };
 
+// Best-effort session touch for PUBLIC table routes.
+// These routes already allow requests with no Authorization header, so an
+// invalid/expired token must be treated the same as no token. Only a valid
+// table_session token actually touches last_active_at.
 const touchSessionFromToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) {
@@ -198,16 +202,16 @@ const touchSessionFromToken = async (req, res, next) => {
 
   const token = getBearerToken(authHeader);
   if (!token) {
-    logAuthDebug('table bill token rejected', { reason: 'invalid_authorization_header' });
-    return res.status(401).json({ success: false, message: 'Invalid authorization header.' });
+    logAuthDebug('table bill token ignored', { reason: 'invalid_authorization_header' });
+    return next();
   }
 
   let claims;
   try {
     claims = jwt.verify(token, JWT_SECRET);
   } catch (error) {
-    logAuthDebug('table bill token rejected', { reason: 'invalid_or_expired_token' });
-    return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
+    logAuthDebug('table bill token ignored', { reason: 'invalid_or_expired_token' });
+    return next();
   }
 
   if (claims.purpose !== 'table_session') {
@@ -218,24 +222,28 @@ const touchSessionFromToken = async (req, res, next) => {
   const tableId = Number(claims.table_id);
   if (!Number.isSafeInteger(sessionId) || sessionId <= 0 ||
       !Number.isSafeInteger(tableId) || tableId <= 0) {
-    return res.status(401).json({ success: false, message: 'Invalid table session token.' });
+    logAuthDebug('table bill token ignored', { reason: 'invalid_claims' });
+    return next();
   }
 
   try {
     const touched = await touchTableSession(sessionId, tableId);
     if (!touched) {
-      logAuthDebug('table bill token rejected', {
+      logAuthDebug('table bill token ignored', {
         session_id: sessionId,
         table_id: tableId,
         reason: 'inactive_session'
       });
-      return res.status(401).json({ success: false, message: 'Table session is no longer active.' });
+    } else {
+      logAuthDebug('table bill session touched', {
+        session_id: sessionId,
+        table_id: tableId
+      });
     }
-    logAuthDebug('table bill session touched', { session_id: sessionId, table_id: tableId });
     return next();
   } catch (error) {
     console.error('Touch table session activity error:', error.message);
-    return res.status(500).json({ success: false, message: 'Failed to update table session activity.' });
+    return next();
   }
 };
 
