@@ -357,6 +357,20 @@ const createOrder = async ({
                 return { ok: false, error: 'NOT_FOUND', message: 'Active parent order not found for this table session.' };
             }
 
+            // Per-ticket bill lock: only the ticket that already asked for the
+            // bill is frozen. Fails open — if the column is missing (undefined)
+            // or the flag is off, ordering behaves exactly as before.
+            const billLockEnabled = String(process.env.BILL_LOCK_ENABLED ?? 'true').toLowerCase() !== 'false';
+            if (billLockEnabled && parentCheck.rows[0].bill_requested_at != null) {
+                await client.query('ROLLBACK');
+                return {
+                    ok: false,
+                    error: 'BILL_ALREADY_REQUESTED',
+                    statusCode: 409,
+                    message: `Bill has already been requested for ticket #${parentOrderId}. Please ask staff to reopen ordering before adding more items.`
+                };
+            }
+
             const parentStatus = parentCheck.rows[0].order_status;
 
             if (parentStatus === 'PENDING' || parentStatus === 'NEW') {

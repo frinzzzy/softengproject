@@ -94,8 +94,14 @@ CREATE TABLE orders (
     order_type VARCHAR(20) NOT NULL DEFAULT 'NEW' CHECK (order_type IN ('NEW', 'ADDITIONAL')),
     order_status VARCHAR(30) DEFAULT 'PENDING' CHECK (order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'COMPLETED', 'CANCELLED', 'DECLINED')),
     decline_reason VARCHAR(255),
+    bill_requested_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Backwards-compatible migration for existing deployments.
+-- Per-ticket bill state (single source of truth). Ang table_sessions.bill_requested_at
+-- ay legacy/session-level aggregate lang at hindi na binabasa para sa per-ticket UI.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_requested_at TIMESTAMP;
 
 CREATE TABLE order_items (
     id SERIAL PRIMARY KEY,

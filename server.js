@@ -19,6 +19,7 @@ const { startAutoCloseMonitor } = require('./autoclose');
 
 const eventHub = require('./eventHub');
 const notificationService = require('./notificationService');
+const { initBillState } = require('./billState');
 
 const { 
   createEventReservation, 
@@ -43,6 +44,8 @@ const {
   cancelOrder,
   cancelTableSession,
   requestBill,
+  requestOrderBill,
+  reopenOrderBill,
   updateItemStock
 } = require('./orders');
 
@@ -373,6 +376,8 @@ app.get('/api/v1/orders/unfinished', getUnfinishedOrders);
 app.get('/api/v1/orders/:id', getOrderById);
 app.get('/api/v1/tables/:table_id/bill', getTableSessionBill);
 app.post('/api/v1/tables/:table_id/bill', touchSessionFromToken, requestBill);
+app.post('/api/v1/tables/:table_id/orders/:order_id/bill', touchSessionFromToken, requestOrderBill);
+app.post('/api/v1/orders/:order_id/bill/reopen', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), reopenOrderBill);
 app.get('/api/v1/orders', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'), getOrders);
 
 app.get('/api/v1/customer/orders/live', getCustomerLiveOrders);
@@ -381,6 +386,7 @@ app.get('/api/v1/customer/orders/recent', getRecentCustomerOrders);
 app.get('/api/v1/customer/sessions/:session_id/orders/:order_id', authenticateSessionToken, touchAuthenticatedSession, getSessionOrder);
 app.get('/api/v1/customer/sessions/:session_id/orders-summary', authenticateSessionToken, touchAuthenticatedSession, getSessionOrdersSummary);
 app.post('/api/v1/customer/sessions/:session_id/bill', authenticateSessionToken, touchAuthenticatedSession, requestBill);
+app.post('/api/v1/customer/sessions/:session_id/orders/:order_id/bill', authenticateSessionToken, touchAuthenticatedSession, requestOrderBill);
 app.post('/api/v1/customer/sessions/:session_id/activity', authenticateSessionToken, touchAuthenticatedSession, (req, res) => {
   const sessionId = Number(req.params.session_id);
   return res.status(200).json({ success: true, session_id: sessionId });
@@ -726,6 +732,17 @@ app.get('/api/v1/customer/menu', async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[LMCO Backend] Server running on http://10.128.25.7:${PORT}`);
-});
+// Per-ticket bill state: additive self-migration. Kapag nag-fail ang DDL,
+// tuloy pa rin ang server at session-level fallback ang gagamitin.
+Promise.race([
+  initBillState(),
+  new Promise((resolve) => setTimeout(resolve, 8000))
+])
+  .catch((error) => {
+    console.error('[BillState] Initialization skipped:', error && error.message ? error.message : error);
+  })
+  .finally(() => {
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`[LMCO Backend] Server running on http://10.128.25.7:${PORT}`);
+    });
+  });

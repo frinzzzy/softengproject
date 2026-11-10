@@ -8,6 +8,7 @@ const SOCKET_EVENT_MAP = {
     'order.cancelled': 'order_cancelled',
     'session.cancelled': 'session_cancelled',
     'bill.requested': 'bill_requested',
+    'bill.reopened': 'bill_reopened',
     'additional_items_added': 'additional_items_added',
     'table_session_closed': 'table_session_closed'
 };
@@ -72,6 +73,7 @@ class EventHub extends EventEmitter {
     emitOrderCancelled(payload) { return this._publish('order.cancelled', payload); }
     emitSessionCancelled(payload) { return this._publish('session.cancelled', payload); }
     emitBillRequested(payload) { return this._publish('bill.requested', payload); }
+    emitBillReopened(payload) { return this._publish('bill.reopened', payload); }
     emitAdditionalItemsAdded(payload) { return this._publish('additional_items_added', payload); }
     emitTableSessionClosed(payload) { return this._publish('table_session_closed', payload); }
 }

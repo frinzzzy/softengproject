@@ -4,6 +4,7 @@ const inventoryService = require('./inventoryService');
 const orderService = require('./orderService');
 const paymentService = require('./paymentService');
 const notificationService = require('./notificationService');
+const billState = require('./billState');
 
 const logApiResponse = (endpoint, details) => {
     if (process.env.DEBUG_API_RESPONSES === 'true') {
@@ -41,6 +42,7 @@ const createOrder = async (req, res) => {
     if (!result.ok) {
         return res.status(result.statusCode || 500).json({
             success: false,
+            code: result.error || null,
             message: result.message
         });
     }
@@ -132,6 +134,7 @@ const getOrderById = async (req, res) => {
                 o.order_status,
                 o.decline_reason,
                 o.created_at,
+                ${billState.readExpression('o')} AS bill_requested_at,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
@@ -267,6 +270,9 @@ const getTableSessionBill = async (req, res) => {
                             'order_code', '#BS-' || o.id,
                             'status', o.order_status,
                             'order_total', o.total_amount,
+                            'parent_order_id', o.parent_order_id,
+                            'is_additional_order', COALESCE(o.is_additional_order, FALSE),
+                            'bill_requested_at', ${billState.readExpression('o', 'ts.bill_requested_at')},
                             'time', TO_CHAR(o.created_at, 'HH12:MI AM - Mon DD'),
                             'items', COALESCE(
                                 (
@@ -333,7 +339,10 @@ const getTableSessionBill = async (req, res) => {
                     grand_total: 0,
                     orders: [],
                     bill_requested_at: null,
-                    bill_requested: false
+                    bill_requested: false,
+                    session_bill_requested_at: null,
+                    ticket_count: 0,
+                    requested_ticket_count: 0
                 }
             });
         }
@@ -342,7 +351,12 @@ const getTableSessionBill = async (req, res) => {
             success: true,
             data: {
                 ...rows[0],
-                bill_requested: rows[0].bill_requested_at != null
+                bill_requested: rows[0].bill_requested_at != null,
+                session_bill_requested_at: rows[0].bill_requested_at ?? null,
+                ticket_count: Array.isArray(rows[0].orders) ? rows[0].orders.length : 0,
+                requested_ticket_count: Array.isArray(rows[0].orders)
+                    ? rows[0].orders.filter((order) => order && order.bill_requested_at != null).length
+                    : 0
             }
         });
     } catch (error) {
@@ -406,9 +420,14 @@ const getOrders = async (req, res) => {
                 CASE
                     WHEN UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
                      AND UPPER(o.order_status) NOT IN ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED')
+                    THEN ${billState.readExpression('o', 'ts.bill_requested_at')}
+                    ELSE NULL
+                END AS bill_requested_at,
+                CASE
+                    WHEN UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
                     THEN ts.bill_requested_at
                     ELSE NULL
-                END AS bill_requested_at
+                END AS session_bill_requested_at
             FROM orders o
             LEFT JOIN tables t ON o.table_id = t.id
             LEFT JOIN table_sessions ts ON o.session_id = ts.id
@@ -515,7 +534,8 @@ const getCustomerLiveOrders = async (req, res) => {
                         )
                     ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
                 ) AS items,
-                ts.bill_requested_at AS bill_requested_at
+                ${billState.readExpression('o', 'ts.bill_requested_at')} AS bill_requested_at,
+                ts.bill_requested_at AS session_bill_requested_at
             FROM orders o
             LEFT JOIN tables t ON o.table_id = t.id
             LEFT JOIN table_sessions ts
@@ -601,6 +621,7 @@ const getRecentCustomerOrders = async (req, res) => {
                 o.order_status,
                 o.decline_reason,
                 o.created_at,
+                ${billState.readExpression('o')} AS bill_requested_at,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
@@ -662,6 +683,7 @@ const getSessionOrder = async (req, res) => {
                 o.total_amount,
                 o.order_status,
                 o.created_at,
+                ${billState.readExpression('o', 'ts.bill_requested_at')} AS bill_requested_at,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
@@ -700,7 +722,7 @@ const getSessionOrder = async (req, res) => {
              LEFT JOIN menu_items m ON m.id = oi.menu_item_id
              WHERE o.id = $1::int
                AND o.session_id = $2::int
-             GROUP BY o.id`,
+             GROUP BY o.id, ts.bill_requested_at`,
             [orderId, sessionId]
         );
 
@@ -746,6 +768,7 @@ const getSessionOrdersSummary = async (req, res) => {
                 o.total_amount,
                 o.total_amount AS grand_total,
                 o.created_at,
+                ${billState.columnExpression('o')} AS bill_requested_at,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
@@ -1306,6 +1329,27 @@ const requestBill = async (req, res) => {
         const billSummaryRes = await client.query(billSummaryQuery, [activeSession.id]);
         const summary = billSummaryRes.rows[0];
 
+        const unservedRes = await client.query(
+            `SELECT id, COALESCE(order_status, 'PENDING') AS order_status
+               FROM orders
+              WHERE session_id = $1::int
+                AND UPPER(order_status) IN ('PENDING', 'PREPARING', 'READY', 'NEW')`,
+            [activeSession.id]
+        );
+        const unservedOrders = unservedRes.rows;
+
+        let markedTicketCount = 0;
+        if (billState.isAvailable()) {
+            const marked = await client.query(
+                `UPDATE orders
+                    SET bill_requested_at = COALESCE(bill_requested_at, clock_timestamp())
+                  WHERE session_id = $1::int
+                    AND UPPER(order_status) IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW')`,
+                [activeSession.id]
+            );
+            markedTicketCount = marked.rowCount;
+        }
+
         const grandTotal = parseFloat(summary.grand_total);
         const totalOrders = parseInt(summary.total_orders, 10);
         await client.query('COMMIT');
@@ -1334,7 +1378,10 @@ const requestBill = async (req, res) => {
             grand_total: grandTotal.toFixed(2),
             bill_requested_at: billRequestedAt,
             bill_status: 'REQUESTED',
-            already_requested: alreadyRequested
+            already_requested: alreadyRequested,
+            marked_ticket_count: markedTicketCount,
+            all_orders_served: unservedOrders.length === 0,
+            unserved_orders: unservedOrders
         };
 
         return res.status(200).json({
@@ -1358,6 +1405,266 @@ const requestBill = async (req, res) => {
         });
     } finally {
         client.release();
+    }
+};
+
+const requestOrderBill = async (req, res) => {
+    const orderId = Number(req.params.order_id);
+    const rawSessionId = req.params.session_id ?? (req.body && req.body.session_id != null ? req.body.session_id : null);
+    const sessionId = rawSessionId == null ? null : Number(rawSessionId);
+
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid order_id is required to request a bill.'
+        });
+    }
+
+    if (sessionId !== null && (!Number.isSafeInteger(sessionId) || sessionId <= 0)) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid session_id is required to request a bill.'
+        });
+    }
+
+    if (!billState.isAvailable()) {
+        return res.status(503).json({
+            success: false,
+            message: 'Per-ticket bill requests are temporarily unavailable. Please try again shortly.'
+        });
+    }
+
+    const eventHub = req.app.get('event_hub');
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        const params = sessionId !== null ? [orderId, sessionId] : [orderId];
+        const orderRes = await client.query(
+            `SELECT o.id, o.session_id, o.table_id, o.parent_order_id, o.order_status,
+                    o.bill_requested_at, ts.session_status
+               FROM orders o
+               JOIN table_sessions ts ON ts.id = o.session_id
+              WHERE o.id = $1::int
+                ${sessionId !== null ? 'AND o.session_id = $2::int' : ''}
+              FOR UPDATE OF o`,
+            params
+        );
+
+        if (orderRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                message: 'Order not found for this table session.'
+            });
+        }
+
+        const order = orderRes.rows[0];
+
+        if (!['ACTIVE', 'OPEN'].includes(String(order.session_status || '').toUpperCase())) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                success: false,
+                message: 'This table session is already closed.'
+            });
+        }
+
+        if (['COMPLETED', 'CANCELLED', 'DECLINED', 'PAID'].includes(String(order.order_status || '').toUpperCase())) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                success: false,
+                message: 'This ticket can no longer request a bill.'
+            });
+        }
+
+        const ticketRootId = Number(order.parent_order_id ?? order.id);
+
+        const updated = await client.query(
+            `UPDATE orders
+                SET bill_requested_at = COALESCE(bill_requested_at, clock_timestamp())
+              WHERE session_id = $1::int
+                AND (id = $2::int OR parent_order_id = $2::int)
+              RETURNING id, bill_requested_at`,
+            [order.session_id, ticketRootId]
+        );
+
+        const ticketRow = updated.rows.find((row) => Number(row.id) === ticketRootId) || updated.rows[0];
+        const billRequestedAt = ticketRow ? ticketRow.bill_requested_at : null;
+        const alreadyRequested = order.bill_requested_at != null;
+
+        const totalsRes = await client.query(
+            `SELECT COALESCE(SUM(total_amount), 0) AS ticket_total
+               FROM orders
+              WHERE session_id = $1::int
+                AND (id = $2::int OR parent_order_id = $2::int)
+                AND UPPER(order_status) NOT IN ('CANCELLED', 'DECLINED')`,
+            [order.session_id, ticketRootId]
+        );
+
+        const unservedRes = await client.query(
+            `SELECT id, COALESCE(order_status, 'PENDING') AS order_status
+               FROM orders
+              WHERE session_id = $1::int
+                AND UPPER(order_status) IN ('PENDING', 'PREPARING', 'READY', 'NEW')`,
+            [order.session_id]
+        );
+
+        await client.query('COMMIT');
+
+        const ticketTotal = parseFloat(totalsRes.rows[0] ? totalsRes.rows[0].ticket_total : 0);
+        const unservedOrders = unservedRes.rows;
+
+        if (!alreadyRequested && eventHub) {
+            try {
+                eventHub.emitBillRequested({
+                    order_id: ticketRootId,
+                    ticket_order_id: ticketRootId,
+                    table_id: order.table_id,
+                    session_id: order.session_id,
+                    bill_requested_at: billRequestedAt,
+                    bill_status: 'REQUESTED',
+                    scope: 'ticket',
+                    total_orders: updated.rows.length,
+                    grand_total: ticketTotal,
+                    requested_at: billRequestedAt,
+                    message: `Ticket #${ticketRootId} requested bill out. Total: ₱${ticketTotal.toFixed(2)}`
+                });
+            } catch (emitError) {
+                console.error('Ticket bill request event emit error:', emitError.message);
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: alreadyRequested
+                ? `Bill has already been requested for ticket #${ticketRootId}.`
+                : `Bill request sent successfully for ticket #${ticketRootId}.`,
+            data: {
+                order_id: ticketRootId,
+                session_id: order.session_id,
+                table_id: order.table_id,
+                bill_requested_at: billRequestedAt,
+                bill_status: 'REQUESTED',
+                ticket_total: ticketTotal.toFixed(2),
+                ticket_order_ids: updated.rows.map((row) => row.id),
+                already_requested: alreadyRequested,
+                all_orders_served: unservedOrders.length === 0,
+                unserved_orders: unservedOrders
+            }
+        });
+    } catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Ticket bill request rollback error:', rollbackError.message);
+        }
+        console.error('Ticket bill request error:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: error.message || 'Failed to process ticket bill request.'
+        });
+    } finally {
+        client.release();
+    }
+};
+
+const reopenOrderBill = async (req, res) => {
+    const orderId = Number(req.params.order_id);
+
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid order_id is required.'
+        });
+    }
+
+    if (!billState.isAvailable()) {
+        return res.status(503).json({
+            success: false,
+            message: 'Per-ticket bill state is temporarily unavailable.'
+        });
+    }
+
+    const eventHub = req.app.get('event_hub');
+
+    try {
+        const orderRes = await pool.query(
+            `SELECT id, parent_order_id, session_id, table_id
+               FROM orders
+              WHERE id = $1::int`,
+            [orderId]
+        );
+
+        if (orderRes.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Order not found.'
+            });
+        }
+
+        const order = orderRes.rows[0];
+        const ticketRootId = Number(order.parent_order_id ?? order.id);
+
+        const cleared = await pool.query(
+            `UPDATE orders
+                SET bill_requested_at = NULL
+              WHERE id = $1::int OR parent_order_id = $1::int
+              RETURNING id`,
+            [ticketRootId]
+        );
+
+        // Keep the legacy session-level marker consistent: only clear it when
+        // no other ticket in the session is still waiting for a bill.
+        if (order.session_id != null) {
+            const remaining = await pool.query(
+                `SELECT COUNT(*) AS count
+                   FROM orders
+                  WHERE session_id = $1::int
+                    AND bill_requested_at IS NOT NULL`,
+                [order.session_id]
+            );
+            if (parseInt(remaining.rows[0].count, 10) === 0) {
+                await pool.query(
+                    `UPDATE table_sessions
+                        SET bill_requested_at = NULL
+                      WHERE id = $1::int`,
+                    [order.session_id]
+                );
+            }
+        }
+
+        if (eventHub) {
+            try {
+                eventHub.emitBillReopened({
+                    order_id: ticketRootId,
+                    table_id: order.table_id,
+                    session_id: order.session_id,
+                    scope: 'ticket',
+                    status_changed_at: new Date().toISOString(),
+                    message: `Ordering reopened for ticket #${ticketRootId}.`
+                });
+            } catch (emitError) {
+                console.error('Bill reopen event emit error:', emitError.message);
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: `Ordering reopened for ticket #${ticketRootId}.`,
+            data: {
+                order_id: ticketRootId,
+                session_id: order.session_id,
+                table_id: order.table_id,
+                reopened_order_ids: cleared.rows.map((row) => row.id)
+            }
+        });
+    } catch (error) {
+        console.error('Reopen ticket bill error:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: error.message || 'Failed to reopen ordering for this ticket.'
+        });
     }
 };
 
@@ -1449,5 +1756,7 @@ module.exports = {
     cancelOrder,
     cancelTableSession,
     requestBill,
+    requestOrderBill,
+    reopenOrderBill,
     updateItemStock
 };
