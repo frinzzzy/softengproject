@@ -326,7 +326,7 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
       );
     } else {
       // Kung walang ACTIVE/OPEN session pero may kaka-close lang na session
-      // (max 2 hours) na may pending orders, i-reactivate ito — para hindi
+      // (max 12 hours) na may pending orders, i-reactivate ito — para hindi
       // maiwan ang bill/orders sa isang closed session at hindi mag-blank ang
       // customer bill matapos mag-scan.
       const recentSessionResult = await pool.query(
@@ -335,7 +335,7 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
           WHERE ts.table_id = $1
             AND UPPER(ts.session_status) = 'CLOSED'
             AND ts.closed_at IS NOT NULL
-            AND ts.closed_at > CURRENT_TIMESTAMP - INTERVAL '2 hours'
+            AND ts.closed_at > CURRENT_TIMESTAMP - INTERVAL '12 hours'
             AND EXISTS (
                 SELECT 1
                   FROM orders o
