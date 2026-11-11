@@ -15,8 +15,6 @@ if (!JWT_SECRET) {
 const authRoutes = require('./auth');
 const assistanceRoutes = require('./assistance');
 
-const { startAutoCloseMonitor } = require('./autoclose');
-
 const eventHub = require('./eventHub');
 const notificationService = require('./notificationService');
 const { initBillState } = require('./billState');
@@ -102,8 +100,6 @@ io.on('connection', (socket) => {
     console.log(`🔌 [Socket.io] User disconnected: ${socket.id}`);
   });
 });
-
-startAutoCloseMonitor(eventHub);
 
 const logAuthDebug = (event, details) => {
   if (process.env.DEBUG_API_RESPONSES === 'true') {

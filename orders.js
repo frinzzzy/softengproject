@@ -42,6 +42,7 @@ const createOrder = async (req, res) => {
     if (!result.ok) {
         return res.status(result.statusCode || 500).json({
             success: false,
+            ...(result.error === 'SESSION_CLOSED' ? { error: result.error } : {}),
             code: result.error || null,
             message: result.message
         });
@@ -342,6 +343,26 @@ const getTableSessionBill = async (req, res) => {
                     bill_requested: false,
                     session_bill_requested_at: null,
                     ticket_count: 0,
+                    requested_ticket_count: 0,
+                    session_id: null,
+                    session_status: 'CLOSED'
+                }
+            });
+        }
+
+        if (rows[0].session_id == null) {
+            return res.status(200).json({
+                success: true,
+                data: {
+                    ...rows[0],
+                    session_id: null,
+                    session_status: 'CLOSED',
+                    grand_total: 0,
+                    orders: [],
+                    bill_requested_at: null,
+                    bill_requested: false,
+                    session_bill_requested_at: null,
+                    ticket_count: 0,
                     requested_ticket_count: 0
                 }
             });
@@ -418,8 +439,7 @@ const getOrders = async (req, res) => {
                     ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
                 ) AS items,
                 CASE
-                    WHEN UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
-                     AND UPPER(o.order_status) NOT IN ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED')
+                    WHEN UPPER(o.order_status) NOT IN ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED')
                     THEN ${billState.readExpression('o', 'ts.bill_requested_at')}
                     ELSE NULL
                 END AS bill_requested_at,

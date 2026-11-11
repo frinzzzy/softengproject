@@ -1,6 +1,7 @@
 const pool = require('./db');
 const crypto = require('crypto');
 const inventoryService = require('./inventoryService');
+const billState = require('./billState');
 
 const updateOrderStatus = async (orderId, status, declineReason) => {
     const client = await pool.connect();
@@ -207,7 +208,7 @@ const createOrder = async ({
         let targetSessionId = finalSessionId;
         if (targetSessionId !== null) {
             const sessionRes = await client.query(
-                `SELECT id
+                `SELECT id, session_status
                  FROM table_sessions
                  WHERE id = $1::int
                    AND table_id = $2::int
@@ -234,6 +235,38 @@ const createOrder = async ({
             if (activeSessionRes.rows.length > 0) {
                 await client.query('ROLLBACK');
                 return { ok: false, error: 'CONFLICT', message: 'Another active session already exists for this table.' };
+            }
+
+            const isClosedSession = String(sessionRes.rows[0].session_status || '').toUpperCase() === 'CLOSED';
+            if (isClosedSession) {
+                const nonTerminalOrders = await client.query(
+                    `SELECT COUNT(*) AS count
+                     FROM orders
+                     WHERE session_id = $1::int
+                       AND UPPER(order_status) NOT IN ('PAID', 'COMPLETED', 'CANCELLED', 'DECLINED')`,
+                    [targetSessionId]
+                );
+
+                if (Number(nonTerminalOrders.rows[0].count) === 0) {
+                    await client.query('ROLLBACK');
+                    return {
+                        ok: false,
+                        error: 'SESSION_CLOSED',
+                        statusCode: 409,
+                        message: 'This table session has already been settled. Please rescan the table QR to start a new session.'
+                    };
+                }
+
+                if (billState.isAvailable()) {
+                    await client.query(
+                        `UPDATE orders
+                         SET bill_requested_at = NULL
+                         WHERE session_id = $1::int
+                           AND UPPER(order_status) IN ('PAID', 'COMPLETED', 'CANCELLED', 'DECLINED')
+                           AND bill_requested_at IS NOT NULL`,
+                        [targetSessionId]
+                    );
+                }
             }
 
             await client.query(
