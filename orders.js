@@ -319,9 +319,27 @@ const getTableSessionBill = async (req, res) => {
                     '[]'::json
                 ) AS orders
             FROM tables t
-            LEFT JOIN table_sessions ts
-                ON ts.table_id = t.id
-               AND UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
+            LEFT JOIN LATERAL (
+                SELECT ts.*
+                  FROM table_sessions ts
+                 WHERE ts.table_id = t.id
+                   AND (
+                       UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
+                       OR (ts.closed_at IS NOT NULL
+                           AND ts.closed_at > CURRENT_TIMESTAMP - INTERVAL '2 hours')
+                   )
+                 ORDER BY
+                   -- Unahin ang session na may live orders para hindi mag-blank
+                   -- ang bill kahit may bagong empty ACTIVE session.
+                   (EXISTS (
+                       SELECT 1 FROM orders o2
+                        WHERE o2.session_id = ts.id
+                          AND o2.order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW')
+                   )) DESC,
+                   CASE WHEN UPPER(ts.session_status) IN ('ACTIVE', 'OPEN') THEN 0 ELSE 1 END,
+                   ts.id DESC
+                 LIMIT 1
+            ) ts ON TRUE
             LEFT JOIN orders o
                 ON o.session_id = ts.id
                AND (o.order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'NEW') AND o.order_status NOT IN ('CANCELLED', 'DECLINED', 'COMPLETED'))
@@ -439,7 +457,15 @@ const getOrders = async (req, res) => {
                     ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
                 ) AS items,
                 CASE
-                    WHEN UPPER(o.order_status) NOT IN ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED')
+                    WHEN UPPER(o.order_status) NOT IN ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED', 'REJECTED')
+                     -- Session visibility window: ACTIVE/OPEN, o kaka-close lang
+                     -- (max 2 hours). Pinipigilan nito ang lumang naka-abandona
+                     -- na bill requests na pabalik-balik sa admin notifications.
+                     AND (
+                         UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
+                         OR (ts.closed_at IS NOT NULL
+                             AND ts.closed_at > CURRENT_TIMESTAMP - INTERVAL '2 hours')
+                     )
                     THEN ${billState.readExpression('o', 'ts.bill_requested_at')}
                     ELSE NULL
                 END AS bill_requested_at,
@@ -479,7 +505,7 @@ const getOrders = async (req, res) => {
             query += ` WHERE ` + conditions.join(' AND ');
         }
 
-        query += ` GROUP BY o.id, t.table_number, ts.session_status, ts.bill_requested_at ORDER BY o.created_at DESC;`;
+        query += ` GROUP BY o.id, t.table_number, ts.session_status, ts.bill_requested_at, ts.closed_at ORDER BY o.created_at DESC;`;
 
         const { rows } = await pool.query(query, values);
 

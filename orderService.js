@@ -237,13 +237,17 @@ const createOrder = async ({
                 return { ok: false, error: 'CONFLICT', message: 'Another active session already exists for this table.' };
             }
 
-            const isClosedSession = String(sessionRes.rows[0].session_status || '').toUpperCase() === 'CLOSED';
+            // Anumang status na hindi ACTIVE/OPEN ay itinuturing na closed/
+            // settled — hindi na dapat buksan muli kung wala nang pending orders.
+            const sessionStatus = String(sessionRes.rows[0].session_status || '').toUpperCase();
+            const isClosedSession = !['ACTIVE', 'OPEN'].includes(sessionStatus);
             if (isClosedSession) {
                 const nonTerminalOrders = await client.query(
                     `SELECT COUNT(*) AS count
                      FROM orders
                      WHERE session_id = $1::int
-                       AND UPPER(order_status) NOT IN ('PAID', 'COMPLETED', 'CANCELLED', 'DECLINED')`,
+                       AND UPPER(order_status) NOT IN
+                           ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED', 'REJECTED')`,
                     [targetSessionId]
                 );
 
@@ -262,7 +266,8 @@ const createOrder = async ({
                         `UPDATE orders
                          SET bill_requested_at = NULL
                          WHERE session_id = $1::int
-                           AND UPPER(order_status) IN ('PAID', 'COMPLETED', 'CANCELLED', 'DECLINED')
+                           AND UPPER(order_status) IN
+                               ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED', 'REJECTED')
                            AND bill_requested_at IS NOT NULL`,
                         [targetSessionId]
                     );

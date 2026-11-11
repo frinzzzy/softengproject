@@ -325,11 +325,48 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
         [session.id]
       );
     } else {
-      const newSessionResult = await pool.query(
-        "INSERT INTO table_sessions (table_id, session_status, last_active_at) VALUES ($1, 'ACTIVE', CURRENT_TIMESTAMP) RETURNING *",
+      // Kung walang ACTIVE/OPEN session pero may kaka-close lang na session
+      // (max 2 hours) na may pending orders, i-reactivate ito — para hindi
+      // maiwan ang bill/orders sa isang closed session at hindi mag-blank ang
+      // customer bill matapos mag-scan.
+      const recentSessionResult = await pool.query(
+        `SELECT ts.*
+           FROM table_sessions ts
+          WHERE ts.table_id = $1
+            AND UPPER(ts.session_status) = 'CLOSED'
+            AND ts.closed_at IS NOT NULL
+            AND ts.closed_at > CURRENT_TIMESTAMP - INTERVAL '2 hours'
+            AND EXISTS (
+                SELECT 1
+                  FROM orders o
+                 WHERE o.session_id = ts.id
+                   AND UPPER(o.order_status) NOT IN
+                       ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED', 'REJECTED')
+            )
+          ORDER BY ts.id DESC
+          LIMIT 1`,
         [foundTable.id]
       );
-      session = newSessionResult.rows[0];
+
+      if (recentSessionResult.rows.length > 0) {
+        const reopenedSession = await pool.query(
+          `UPDATE table_sessions
+              SET session_status = 'ACTIVE',
+                  closed_at = NULL,
+                  last_active_at = CURRENT_TIMESTAMP,
+                  bill_requested_at = NULL
+            WHERE id = $1::int
+            RETURNING *`,
+          [recentSessionResult.rows[0].id]
+        );
+        session = reopenedSession.rows[0];
+      } else {
+        const newSessionResult = await pool.query(
+          "INSERT INTO table_sessions (table_id, session_status, last_active_at) VALUES ($1, 'ACTIVE', CURRENT_TIMESTAMP) RETURNING *",
+          [foundTable.id]
+        );
+        session = newSessionResult.rows[0];
+      }
     }
 
     return res.status(200).json({
