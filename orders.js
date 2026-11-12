@@ -325,8 +325,15 @@ const getTableSessionBill = async (req, res) => {
                  WHERE ts.table_id = t.id
                    AND (
                        UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
-                       OR (ts.closed_at IS NOT NULL
-                           AND ts.closed_at > CURRENT_TIMESTAMP - INTERVAL '12 hours')
+                       -- Kung closed na pero may live (hindi terminal) orders pa,
+                       -- ipakita pa rin ito. Walang time window para hindi
+                       -- mawala ang bill request sa customer.
+                       OR EXISTS (
+                           SELECT 1 FROM orders o2
+                            WHERE o2.session_id = ts.id
+                              AND UPPER(o2.order_status) NOT IN
+                                  ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED', 'REJECTED')
+                       )
                    )
                  ORDER BY
                    -- Unahin ang session na may live orders para hindi mag-blank
@@ -458,14 +465,6 @@ const getOrders = async (req, res) => {
                 ) AS items,
                 CASE
                     WHEN UPPER(o.order_status) NOT IN ('PAID', 'COMPLETED', 'CLOSED', 'SETTLED', 'CANCELLED', 'DECLINED', 'REJECTED')
-                     -- Session visibility window: ACTIVE/OPEN, o kaka-close lang
-                     -- (max 12 hours). Pinipigilan nito ang lumang naka-abandona
-                     -- na bill requests na pabalik-balik sa admin notifications.
-                     AND (
-                         UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
-                         OR (ts.closed_at IS NOT NULL
-                             AND ts.closed_at > CURRENT_TIMESTAMP - INTERVAL '12 hours')
-                     )
                     THEN ${billState.readExpression('o', 'ts.bill_requested_at')}
                     ELSE NULL
                 END AS bill_requested_at,
