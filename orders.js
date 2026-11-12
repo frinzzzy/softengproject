@@ -97,6 +97,27 @@ const createOrder = async (req, res) => {
         }
     }
 
+    // Background push para sa admin/staff devices. Socket lang ang dating
+    // path kapag buhay ang app; ito ang sumasalo kapag naka-background o
+    // patay ang app.
+    const itemCount = Array.isArray(result.added_items) ? result.added_items.length : 0;
+    const totalAmount = Number(result.order.total_amount || 0);
+    notificationService.sendStaffNotification({
+        title: isAdditional
+            ? `Additional Order — Table #${result.order.table_id}`
+            : `New Order — Table #${result.order.table_id}`,
+        body: `Order #${result.order.id}${itemCount > 0 ? ` • ${itemCount} item(s)` : ''}${totalAmount > 0 ? ` • ₱${totalAmount.toFixed(2)}` : ''}`,
+        data: {
+            type: isAdditional ? 'additional_order' : 'new_order',
+            order_id: result.order.id,
+            session_id: result.order.session_id,
+            table_id: result.order.table_id,
+            is_additional: isAdditional ? '1' : '0'
+        }
+    }).catch((pushError) => {
+        console.error('[FCM] Failed to send staff new-order notification:', pushError.message);
+    });
+
     return res.status(201).json({
         success: true,
         message: isAdditional ? 'Additional items added to the parent order.' : 'New order created.',
@@ -1416,6 +1437,22 @@ const requestBill = async (req, res) => {
             }
         }
 
+        if (!alreadyRequested) {
+            notificationService.sendStaffNotification({
+                title: `Bill Requested — Table #${tableId}`,
+                body: `Grand total ₱${grandTotal.toFixed(2)} • ${totalOrders} order(s)`,
+                data: {
+                    type: 'bill_requested',
+                    session_id: activeSession.id,
+                    table_id: tableId,
+                    grand_total: grandTotal.toFixed(2),
+                    scope: 'session'
+                }
+            }).catch((pushError) => {
+                console.error('[FCM] Failed to send staff bill-request notification:', pushError.message);
+            });
+        }
+
         const responseData = {
             table_id: tableId,
             session_id: activeSession.id,
@@ -1580,6 +1617,23 @@ const requestOrderBill = async (req, res) => {
             }
         }
 
+        if (!alreadyRequested) {
+            notificationService.sendStaffNotification({
+                title: `Bill Requested — Table #${order.table_id}`,
+                body: `Ticket #${ticketRootId} • ₱${ticketTotal.toFixed(2)}`,
+                data: {
+                    type: 'bill_requested',
+                    order_id: ticketRootId,
+                    session_id: order.session_id,
+                    table_id: order.table_id,
+                    grand_total: ticketTotal.toFixed(2),
+                    scope: 'ticket'
+                }
+            }).catch((pushError) => {
+                console.error('[FCM] Failed to send staff ticket-bill notification:', pushError.message);
+            });
+        }
+
         return res.status(200).json({
             success: true,
             message: alreadyRequested
@@ -1732,7 +1786,7 @@ const updateItemStock = async (req, res) => {
         await client.query('BEGIN');
 
         const itemRes = await client.query(
-            'SELECT id, name, stock_quantity FROM menu_items WHERE id = $1::int FOR UPDATE',
+            'SELECT id, name, stock_quantity, low_stock_threshold FROM menu_items WHERE id = $1::int FOR UPDATE',
             [id]
         );
 
@@ -1768,6 +1822,27 @@ const updateItemStock = async (req, res) => {
                 stock_quantity: newQuantity,
                 is_available: isAvailable,
                 message: `Stock updated for ${currentItem.name}`
+            });
+        }
+
+        const lowStockThreshold = Number(currentItem.low_stock_threshold ?? 10);
+        const becameLow =
+            (previousQuantity > lowStockThreshold && newQuantity <= lowStockThreshold) ||
+            (previousQuantity > 0 && newQuantity <= 0);
+
+        if (becameLow) {
+            notificationService.sendStaffNotification({
+                title: newQuantity <= 0 ? 'Out of Stock' : 'Low Stock',
+                body: `${currentItem.name}${newQuantity <= 0 ? ' is out of stock' : ` is down to ${newQuantity} left`}`,
+                data: {
+                    type: 'low_stock',
+                    item_id: id,
+                    item_name: currentItem.name,
+                    stock_quantity: newQuantity,
+                    low_stock_threshold: lowStockThreshold
+                }
+            }).catch((pushError) => {
+                console.error('[FCM] Failed to send staff low-stock notification:', pushError.message);
             });
         }
 
