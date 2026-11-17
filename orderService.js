@@ -3,6 +3,22 @@ const crypto = require('crypto');
 const inventoryService = require('./inventoryService');
 const billState = require('./billState');
 
+// Legal na status transitions ng isang order. Ang mga status na nasa ilalim ay
+// terminal (walang pwedeng mag-continue pagkatapos ng transition papunta dito).
+// Ginagamit ito para maiwasan ang invalid status jumps (ex. mark-as-served habang
+// nasa PREPARING pa ang kitchen) na maaaring mangyari sa simultaneous staff actions.
+const ORDER_STATUS_FLOW = {
+    PENDING: ['PREPARING', 'DECLINED'],
+    NEW: ['PREPARING', 'DECLINED'],
+    PREPARING: ['READY', 'DECLINED'],
+    READY: ['SERVED', 'DECLINED'],
+    SERVED: ['PAID', 'COMPLETED', 'DECLINED'],
+    PAID: [],
+    COMPLETED: [],
+    CANCELLED: [],
+    DECLINED: [],
+};
+
 const updateOrderStatus = async (orderId, status, declineReason) => {
     const client = await pool.connect();
 
@@ -20,6 +36,25 @@ const updateOrderStatus = async (orderId, status, declineReason) => {
         }
 
         const previousStatus = checkResult.rows[0].order_status;
+        const normalizedPreviousStatus = String(previousStatus || '').toUpperCase();
+        const normalizedStatus = String(status || '').toUpperCase();
+        const allowedTransitions = ORDER_STATUS_FLOW[normalizedPreviousStatus] || [];
+        const isSameStatus = normalizedStatus === normalizedPreviousStatus;
+
+        // State machine validation: basta-basta na lang ang next status. Pinipilit
+        // natin na hindi maaaring malipat ang status nang hindi tama (ex. waiter
+        // nag-mark-as-served habang nasa PREPARING pa ang kitchen).
+        // Ang simultaneous staff actions ay maghahawa sa FOR UPDATE row lock —
+        // kalaunan, makikita ng susunod na transaction ang pinakabagong status.
+        if (!isSameStatus && !allowedTransitions.includes(normalizedStatus)) {
+            await client.query('ROLLBACK');
+            return {
+                ok: false,
+                error: 'INVALID_STATUS_TRANSITION',
+                statusCode: 409,
+                message: `Order #${orderId} cannot transition from '${normalizedPreviousStatus}' to '${normalizedStatus}'.`
+            };
+        }
 
         const shouldRestock = status === 'DECLINED' && previousStatus !== 'DECLINED' && previousStatus !== 'CANCELLED';
 

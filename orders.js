@@ -943,6 +943,14 @@ const updateOrderStatus = async (req, res) => {
             });
         }
 
+        if (result && result.ok === false) {
+            // Halimbawa: invalid status transition (PENDING -> SERVED nang diretso).
+            return res.status(result.statusCode || 409).json({
+                success: false,
+                message: result.message || 'Invalid order status transition.'
+            });
+        }
+
         if (eventHub) {
             try {
                 eventHub.emitOrderStatusUpdated({
