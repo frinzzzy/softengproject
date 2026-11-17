@@ -422,7 +422,7 @@ app.delete(
   notificationService.unregisterStaffFcmToken
 );
 app.patch('/api/v1/orders/:id/status', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN'), updateOrderStatus);
-app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'CASHIER', 'WAITER'), processOrderPayment);
+app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), processOrderPayment);
 app.get('/api/v1/reports/daily-sales', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), getDailySalesReport);
 
 app.post('/api/v1/reservations', createReservation);
