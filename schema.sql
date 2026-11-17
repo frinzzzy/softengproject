@@ -106,6 +106,7 @@ CREATE TABLE orders (
     order_type VARCHAR(20) NOT NULL DEFAULT 'NEW' CHECK (order_type IN ('NEW', 'ADDITIONAL')),
     order_status VARCHAR(30) DEFAULT 'PENDING' CHECK (order_status IN ('PENDING', 'PREPARING', 'READY', 'SERVED', 'COMPLETED', 'CANCELLED', 'DECLINED')),
     decline_reason VARCHAR(255),
+    notes TEXT,
     bill_requested_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

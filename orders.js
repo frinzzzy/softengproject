@@ -19,13 +19,19 @@ const createOrder = async (req, res) => {
         parent_order_id,
         is_additional_order,
         items,
-        client_order_id
+        client_order_id,
+        notes
     } = req.body || {};
 
     const tableId = Number(table_id);
     const sessionId = session_id == null ? null : Number(session_id);
     const parentOrderId = parent_order_id == null ? null : Number(parent_order_id);
     const isAdditional = is_additional_order === true;
+
+    // Special instructions / allergy note. Order-level, max 300 chars.
+    const normalizedNotes = notes == null
+        ? null
+        : String(notes).trim().slice(0, 300) || null;
 
     const idempotencyKey = req.headers['x-idempotency-key'] || client_order_id;
 
@@ -35,6 +41,7 @@ const createOrder = async (req, res) => {
         parentOrderId,
         isAdditional,
         items,
+        notes: normalizedNotes,
         clientOrderId: idempotencyKey,
         idempotencyKey
     });
@@ -64,6 +71,7 @@ const createOrder = async (req, res) => {
             table_id: result.order.table_id,
             status: result.order.order_status,
             total_amount: result.order.total_amount,
+            notes: result.order.notes || null,
             items: result.added_items,
             added_items: isAdditional ? result.added_items : [],
             is_additional_order: isAdditional,
@@ -102,11 +110,14 @@ const createOrder = async (req, res) => {
     // patay ang app.
     const itemCount = Array.isArray(result.added_items) ? result.added_items.length : 0;
     const totalAmount = Number(result.order.total_amount || 0);
+    const notePreview = result.order && result.order.notes
+        ? ` • NOTE: ${String(result.order.notes).replace(/\s+/g, ' ').slice(0, 60)}`
+        : '';
     notificationService.sendStaffNotification({
         title: isAdditional
             ? `Additional Order — Table #${result.order.table_id}`
             : `New Order — Table #${result.order.table_id}`,
-        body: `Order #${result.order.id}${itemCount > 0 ? ` • ${itemCount} item(s)` : ''}${totalAmount > 0 ? ` • ₱${totalAmount.toFixed(2)}` : ''}`,
+        body: `Order #${result.order.id}${itemCount > 0 ? ` • ${itemCount} item(s)` : ''}${totalAmount > 0 ? ` • ₱${totalAmount.toFixed(2)}` : ''}${notePreview}`,
         data: {
             type: isAdditional ? 'additional_order' : 'new_order',
             order_id: result.order.id,
@@ -156,6 +167,7 @@ const getOrderById = async (req, res) => {
                 o.order_status,
                 o.decline_reason,
                 o.created_at,
+                o.notes,
                 ${billState.readExpression('o')} AS bill_requested_at,
                 COALESCE(
                     JSON_AGG(
@@ -229,6 +241,7 @@ const getUnfinishedOrders = async (req, res) => {
                 o.total_amount,
                 o.order_status,
                 o.created_at,
+                o.notes,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
@@ -294,6 +307,7 @@ const getTableSessionBill = async (req, res) => {
                             'order_total', o.total_amount,
                             'parent_order_id', o.parent_order_id,
                             'is_additional_order', COALESCE(o.is_additional_order, FALSE),
+                            'notes', o.notes,
                             'bill_requested_at', ${billState.readExpression('o', 'ts.bill_requested_at')},
                             'time', TO_CHAR(o.created_at, 'HH12:MI AM - Mon DD'),
                             'items', COALESCE(
@@ -456,6 +470,7 @@ const getOrders = async (req, res) => {
                 o.total_amount AS grand_total,
                 o.order_status,
                 o.created_at,
+                o.notes,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
@@ -572,6 +587,7 @@ const getCustomerLiveOrders = async (req, res) => {
                 o.total_amount AS grand_total,
                 o.order_status,
                 o.created_at,
+                o.notes,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
@@ -687,6 +703,7 @@ const getRecentCustomerOrders = async (req, res) => {
                 o.order_status,
                 o.decline_reason,
                 o.created_at,
+                o.notes,
                 ${billState.readExpression('o')} AS bill_requested_at,
                 COALESCE(
                     JSON_AGG(

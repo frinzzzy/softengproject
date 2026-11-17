@@ -114,6 +114,7 @@ const createOrder = async ({
     parentOrderId,
     isAdditional,
     items,
+    notes,
     clientOrderId,
     idempotencyKey
 }) => {
@@ -121,6 +122,10 @@ const createOrder = async ({
     const finalSessionId = sessionId == null ? null : Number(sessionId);
     const finalParentOrderId = parentOrderId == null ? null : Number(parentOrderId);
     const finalIsAdditional = isAdditional === true;
+    // Order-level special instructions (allergy / requests). Optional.
+    const finalNotes = notes == null
+        ? null
+        : String(notes).trim().slice(0, 300) || null;
 
     if (!Number.isSafeInteger(finalTableId) || finalTableId <= 0 ||
         (finalSessionId !== null && (!Number.isSafeInteger(finalSessionId) || finalSessionId <= 0))) {
@@ -415,37 +420,44 @@ const createOrder = async ({
                 const parentRes = await client.query(
                     `UPDATE orders
                      SET total_amount = total_amount + $1::numeric,
-                         is_additional_order = TRUE
+                         is_additional_order = TRUE,
+                         notes = CASE
+                             WHEN $3::text IS NULL THEN notes
+                             WHEN notes IS NULL OR TRIM(notes) = '' THEN $3::text
+                             ELSE notes || E'\n' || $3::text
+                         END
                      WHERE id = $2::int
                      RETURNING *`,
-                    [additionalTotal, parentOrderId]
+                    [additionalTotal, parentOrderId, finalNotes]
                 );
                 targetOrder = parentRes.rows[0];
             } else {
                 const additionalOrderRes = await client.query(
-                    `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status)
-                     VALUES ($1::int, $2::int, $3::int, TRUE, $4::uuid, $5::numeric, 'PENDING')
+                    `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status, notes)
+                     VALUES ($1::int, $2::int, $3::int, TRUE, $4::uuid, $5::numeric, 'PENDING', $6::text)
                      RETURNING *`,
                     [
                         targetSessionId,
                         finalTableId,
                         parentOrderId,
                         crypto.randomUUID(),
-                        additionalTotal
+                        additionalTotal,
+                        finalNotes
                     ]
                 );
                 targetOrder = additionalOrderRes.rows[0];
             }
         } else {
             const newOrderRes = await client.query(
-                `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status)
-                 VALUES ($1::int, $2::int, NULL, FALSE, $3::uuid, $4::numeric, 'PENDING')
+                `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status, notes)
+                 VALUES ($1::int, $2::int, NULL, FALSE, $3::uuid, $4::numeric, 'PENDING', $5::text)
                  RETURNING *`,
                 [
                     targetSessionId,
                     finalTableId,
                     finalClientOrderId,
-                    additionalTotal
+                    additionalTotal,
+                    finalNotes
                 ]
             );
             targetOrder = newOrderRes.rows[0];
