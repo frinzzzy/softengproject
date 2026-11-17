@@ -543,7 +543,7 @@ app.put('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (r
 app.put('/api/v1/orders/:id/cancel', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), cancelOrder);
 app.put('/api/v1/sessions/:session_id/cancel', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'CASHIER'), cancelTableSession);
 
-app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN'), async (req, res) => {
+app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN', 'WAITER'), async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -571,7 +571,7 @@ app.patch('/api/v1/menu/:id/toggle-stock', authenticateToken, authorizeRoles('AD
   }
 });
 
-app.patch('/api/v1/menu/:id/stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN', 'CASHIER'), updateItemStock);
+app.patch('/api/v1/menu/:id/stock', authenticateToken, authorizeRoles('ADMIN', 'KITCHEN', 'CASHIER', 'WAITER'), updateItemStock);
 
 app.delete('/api/v1/menu/:id', authenticateToken, authorizeRoles('ADMIN'), async (req, res) => {
   const { id } = req.params;
