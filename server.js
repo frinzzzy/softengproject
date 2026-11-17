@@ -14,6 +14,9 @@ if (!JWT_SECRET) {
 
 const authRoutes = require('./auth');
 const assistanceRoutes = require('./assistance');
+const adminStaffRoutes = require('./adminStaff');
+const { authenticateToken, authorizeRoles } = require('./authMiddleware');
+const { initStaffAuthSchema } = require('./staffAuthSchema');
 
 const eventHub = require('./eventHub');
 const notificationService = require('./notificationService');
@@ -72,6 +75,7 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/admin/staff', authenticateToken, authorizeRoles('ADMIN'), adminStaffRoutes);
 app.use('/api/v1/assistance', assistanceRoutes);
 
 pool.connect((err, client, release) => {
@@ -110,23 +114,6 @@ const logAuthDebug = (event, details) => {
 const getBearerToken = (authorizationHeader) => {
   if (typeof authorizationHeader !== 'string') return null;
   return authorizationHeader.match(/^Bearer\s+(\S+)\s*$/i)?.[1] || null;
-};
-
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ success: false, message: 'Access token required.' });
-  }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ success: false, message: 'Invalid or expired token.' });
-    }
-    req.user = user;
-    next();
-  });
 };
 
 const authenticateSessionToken = (req, res, next) => {
@@ -263,20 +250,6 @@ const touchAuthenticatedSession = async (req, res, next) => {
     console.error('Touch authenticated session error:', error.message);
     return res.status(500).json({ success: false, message: 'Failed to update table session activity.' });
   }
-};
-
-const authorizeRoles = (...allowedRoles) => {
-  return (req, res, next) => {
-    const formattedAllowedRoles = allowedRoles.map(r => r.toUpperCase());
-    
-    if (!req.user || !formattedAllowedRoles.includes(req.user.role.toUpperCase())) {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Access denied: Insufficient permissions for this route.' 
-      });
-    }
-    next();
-  };
 };
 
 app.get('/', (req, res) => {
@@ -785,15 +758,16 @@ app.get('/api/v1/customer/menu', async (req, res) => {
 
 // Per-ticket bill state: additive self-migration. Kapag nag-fail ang DDL,
 // tuloy pa rin ang server at session-level fallback ang gagamitin.
-Promise.race([
+Promise.all([
   initBillState(),
-  new Promise((resolve) => setTimeout(resolve, 8000))
+  initStaffAuthSchema()
 ])
-  .catch((error) => {
-    console.error('[BillState] Initialization skipped:', error && error.message ? error.message : error);
-  })
-  .finally(() => {
+  .then(() => {
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`[LMCO Backend] Server running on http://10.128.25.7:${PORT}`);
     });
+  })
+  .catch((error) => {
+    console.error('[Auth] Required staff schema initialization failed:', error.message);
+    process.exitCode = 1;
   });

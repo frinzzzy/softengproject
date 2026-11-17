@@ -197,7 +197,7 @@ const sendStaffNotification = async ({ title, body, data = {} }) => {
                 android: {
                     priority: 'high',
                     notification: {
-                        channelId: 'balai_silayan_orders',
+                        channelId: 'balai_silayan_orders_v2',
                         icon: 'ic_stat_balai',
                         sound: 'default'
                     }

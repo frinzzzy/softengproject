@@ -6,8 +6,26 @@ CREATE TABLE users (
     username VARCHAR(50) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(20) NOT NULL CHECK (role IN ('ADMIN', 'CASHIER', 'KITCHEN', 'WAITER')),
+    full_name VARCHAR(100),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    token_version INTEGER NOT NULL DEFAULT 0,
+    last_login_at TIMESTAMPTZ,
+    pin_hash VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS staff_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    login_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    logout_at TIMESTAMPTZ,
+    device_info TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_sessions_user_open
+    ON staff_sessions(user_id, last_seen_at DESC)
+    WHERE logout_at IS NULL;
 
 CREATE TABLE  workstations (
     id SERIAL PRIMARY KEY,
