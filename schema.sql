@@ -139,8 +139,17 @@ CREATE TABLE order_items (
     order_id INT REFERENCES orders(id) ON DELETE CASCADE,
     menu_item_id INT REFERENCES menu_items(id),
     quantity INT NOT NULL CHECK (quantity > 0),
-    unit_price DECIMAL(10, 2) NOT NULL
+    unit_price DECIMAL(10, 2) NOT NULL,
+    is_checked BOOLEAN NOT NULL DEFAULT FALSE,
+    checked_at TIMESTAMP,
+    checked_by VARCHAR(120)
 );
+
+-- Per-item checklist (kitchen marks each item done; kitchen/waiter/admin can check).
+-- Backwards-compatible migration for existing deployments.
+ALTER TABLE order_items ADD COLUMN IF NOT EXISTS is_checked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE order_items ADD COLUMN IF NOT EXISTS checked_at TIMESTAMP;
+ALTER TABLE order_items ADD COLUMN IF NOT EXISTS checked_by VARCHAR(120);
 
 CREATE TABLE order_item_addons (
     id SERIAL PRIMARY KEY,

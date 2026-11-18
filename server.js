@@ -17,6 +17,7 @@ const assistanceRoutes = require('./assistance');
 const adminStaffRoutes = require('./adminStaff');
 const { authenticateToken, authorizeRoles } = require('./authMiddleware');
 const { initStaffAuthSchema } = require('./staffAuthSchema');
+const { initOrderChecklistSchema } = require('./orderChecklistSchema');
 
 const eventHub = require('./eventHub');
 const notificationService = require('./notificationService');
@@ -40,6 +41,7 @@ const {
   getSessionOrder,
   getSessionOrdersSummary,
   updateOrderStatus, 
+  setOrderItemChecked,
   processOrderPayment, 
   getDailySalesReport,
   cancelOrder,
@@ -422,6 +424,7 @@ app.delete(
   notificationService.unregisterStaffFcmToken
 );
 app.patch('/api/v1/orders/:id/status', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN'), updateOrderStatus);
+app.patch('/api/v1/orders/:order_id/items/:item_id/check', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN'), setOrderItemChecked);
 app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), processOrderPayment);
 app.get('/api/v1/reports/daily-sales', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), getDailySalesReport);
 
@@ -760,7 +763,8 @@ app.get('/api/v1/customer/menu', async (req, res) => {
 // tuloy pa rin ang server at session-level fallback ang gagamitin.
 Promise.all([
   initBillState(),
-  initStaffAuthSchema()
+  initStaffAuthSchema(),
+  initOrderChecklistSchema()
 ])
   .then(() => {
     server.listen(PORT, '0.0.0.0', () => {

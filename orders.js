@@ -180,6 +180,9 @@ const getOrderById = async (req, res) => {
                             'quantity', oi.quantity,
                             'unit_price', oi.unit_price,
                             'price', oi.unit_price,
+                            'is_checked', COALESCE(oi.is_checked, FALSE),
+                            'checked_at', oi.checked_at,
+                            'checked_by', oi.checked_by,
                             'addons', COALESCE(
                                 (
                                     SELECT JSON_AGG(
@@ -482,6 +485,9 @@ const getOrders = async (req, res) => {
                             'quantity', oi.quantity,
                             'unit_price', oi.unit_price,
                             'price', oi.unit_price,
+                            'is_checked', COALESCE(oi.is_checked, FALSE),
+                            'checked_at', oi.checked_at,
+                            'checked_by', oi.checked_by,
                             'addons', COALESCE(
                                 (
                                     SELECT JSON_AGG(
@@ -599,6 +605,9 @@ const getCustomerLiveOrders = async (req, res) => {
                             'quantity', oi.quantity,
                             'unit_price', oi.unit_price,
                             'price', oi.unit_price,
+                            'is_checked', COALESCE(oi.is_checked, FALSE),
+                            'checked_at', oi.checked_at,
+                            'checked_by', oi.checked_by,
                             'addons', COALESCE(
                                 (
                                     SELECT JSON_AGG(
@@ -1885,6 +1894,89 @@ const updateItemStock = async (req, res) => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// PER-ITEM CHECKLIST
+// Kitchen marks each order item done. Kitchen, waiter, and admin can check.
+// ---------------------------------------------------------------------------
+const setOrderItemChecked = async (req, res) => {
+    const rawOrderId = req.params.order_id ?? req.params.id;
+    const orderId = Number(rawOrderId);
+    const itemId = Number(req.params.item_id);
+    const body = req.body || {};
+    const checked = body.checked === undefined ? true : Boolean(body.checked);
+    const checkedBy = req.user?.full_name || req.user?.username || 'Staff';
+
+    if (!Number.isSafeInteger(orderId) || orderId <= 0 ||
+        !Number.isSafeInteger(itemId) || itemId <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid order_id and item_id are required.'
+        });
+    }
+
+    try {
+        const { rows } = await pool.query(
+            `UPDATE order_items oi
+                SET is_checked = $1::boolean,
+                    checked_at = CASE WHEN $1::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    checked_by = CASE WHEN $1::boolean THEN $2::varchar ELSE NULL END
+               FROM orders o
+              WHERE oi.id = $3::int
+                AND oi.order_id = o.id
+                AND o.id = $4::int
+          RETURNING oi.id,
+                    oi.order_id,
+                    COALESCE(oi.is_checked, FALSE) AS is_checked,
+                    oi.checked_at,
+                    oi.checked_by,
+                    o.session_id,
+                    o.table_id,
+                    o.order_status`,
+            [checked, checkedBy, itemId, orderId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Order item not found for this order.'
+            });
+        }
+
+        const item = rows[0];
+        const eventHub = req.app.get('event_hub');
+        if (eventHub) {
+            try {
+                eventHub.emitOrderUpdated({
+                    order_id: item.order_id,
+                    session_id: item.session_id,
+                    table_id: item.table_id,
+                    status: item.order_status,
+                    checked_item_id: item.id,
+                    is_checked: item.is_checked,
+                    checked_at: item.checked_at,
+                    checked_by: item.checked_by,
+                    event_type: 'item_check',
+                    message: `Order #${item.order_id} item ${item.id} is ${item.is_checked ? 'checked' : 'unchecked'}.`
+                });
+            } catch (emitError) {
+                console.error('[OrderChecklist] Failed to emit order.updated event:', emitError?.message);
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: item.is_checked ? 'Item marked as done.' : 'Item marked as not done.',
+            data: item
+        });
+    } catch (error) {
+        console.error('Update order item checklist error:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to update order item checklist.'
+        });
+    }
+};
+
 module.exports = {
     createOrder,
     getOrderById,
@@ -1896,6 +1988,7 @@ module.exports = {
     getSessionOrder,
     getSessionOrdersSummary,
     updateOrderStatus,
+    setOrderItemChecked,
     processOrderPayment,
     getDailySalesReport,
     cancelOrder,
