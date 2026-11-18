@@ -56,6 +56,32 @@ const updateOrderStatus = async (orderId, status, declineReason) => {
             };
         }
 
+        // Checklist gate: hindi pwedeng i-mark na READY ang order hangga't may
+        // item pang hindi checked. Ito ang nagsisiguro na kumpleto ang kitchen
+        // checklist bago ipasa sa waiter/serving.
+        if (normalizedStatus === 'READY') {
+            const checklistResult = await client.query(
+                `SELECT COUNT(*)::int AS total,
+                        COUNT(*) FILTER (WHERE COALESCE(is_checked, FALSE))::int AS checked
+                   FROM order_items
+                  WHERE order_id = $1::int`,
+                [orderId]
+            );
+            const totalItems = Number(checklistResult.rows[0]?.total || 0);
+            const checkedItems = Number(checklistResult.rows[0]?.checked || 0);
+
+            if (totalItems > 0 && checkedItems < totalItems) {
+                const remaining = totalItems - checkedItems;
+                await client.query('ROLLBACK');
+                return {
+                    ok: false,
+                    error: 'ORDER_NOT_FINISHED',
+                    statusCode: 409,
+                    message: `Order #${orderId} is not finished yet. ${remaining} item(s) still not finished — complete all checklist items before marking it READY.`
+                };
+            }
+        }
+
         const shouldRestock = status === 'DECLINED' && previousStatus !== 'DECLINED' && previousStatus !== 'CANCELLED';
 
         if (shouldRestock) {

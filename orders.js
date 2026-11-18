@@ -1943,26 +1943,11 @@ const setOrderItemChecked = async (req, res) => {
         }
 
         const item = rows[0];
-        const eventHub = req.app.get('event_hub');
-        if (eventHub) {
-            try {
-                eventHub.emitOrderUpdated({
-                    order_id: item.order_id,
-                    session_id: item.session_id,
-                    table_id: item.table_id,
-                    status: item.order_status,
-                    checked_item_id: item.id,
-                    is_checked: item.is_checked,
-                    checked_at: item.checked_at,
-                    checked_by: item.checked_by,
-                    event_type: 'item_check',
-                    message: `Order #${item.order_id} item ${item.id} is ${item.is_checked ? 'checked' : 'unchecked'}.`
-                });
-            } catch (emitError) {
-                console.error('[OrderChecklist] Failed to emit order.updated event:', emitError?.message);
-            }
-        }
 
+        // Sinasadya na walang socket event dito. Ang checklist UI ay may local
+        // optimistic state; ang bawat event kasi ay nag-trigger ng full refresh
+        // at nagdudulot ng flicker habang nagki-click ang kitchen. Ang ibang
+        // devices ay makakatanggap ng update sa regular poll/silent refresh.
         return res.status(200).json({
             success: true,
             message: item.is_checked ? 'Item marked as done.' : 'Item marked as not done.',
