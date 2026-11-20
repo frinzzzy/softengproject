@@ -1,7 +1,7 @@
 const pool = require('./db');
 
 const createEventReservation = async (req, res) => {
-    const { customer_name, contact_number, party_size, event_date, reservation_time, table_id } = req.body;
+    const { customer_name, contact_number, party_size, event_date, reservation_time, table_id, customer_id } = req.body;
 
     if (!customer_name || !contact_number || !party_size || !event_date || !reservation_time || !table_id) {
         return res.status(400).json({ 
@@ -33,19 +33,47 @@ const createEventReservation = async (req, res) => {
             });
         }
 
-        const query = `
-            INSERT INTO event_reservations (customer_name, contact_number, party_size, event_date, reservation_time, table_id, status)
-            VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
-            RETURNING *;
-        `;
-        const { rows } = await pool.query(query, [
+        const columns = [
+            'customer_name',
+            'contact_number',
+            'party_size',
+            'event_date',
+            'reservation_time',
+            'table_id',
+            'status'
+        ];
+        const values = [
             customer_name, 
             contact_number, 
             party_size, 
             event_date, 
             reservation_time, 
-            table_id
-        ]);
+            table_id, 
+            'PENDING'
+        ];
+
+        const existingColumns = await pool.query(
+            `SELECT column_name
+               FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name = 'event_reservations'`
+        );
+        const hasCustomerIdColumn = existingColumns.rows.some(
+            (row) => row.column_name === 'customer_id'
+        );
+
+        if (hasCustomerIdColumn && customer_id !== null && customer_id !== undefined && String(customer_id).trim() !== '') {
+            columns.push('customer_id');
+            values.push(customer_id);
+        }
+
+        const placeholders = values.map((_, index) => `$${index + 1}`).join(', ');
+        const query = `
+            INSERT INTO event_reservations (${columns.join(', ')})
+            VALUES (${placeholders})
+            RETURNING *;
+        `;
+        const { rows } = await pool.query(query, values);
 
         return res.status(201).json({
             success: true,
@@ -82,7 +110,7 @@ const getEventReservations = async (req, res) => {
 
 const updateEventReservation = async (req, res) => {
     const { id } = req.params;
-    const { customer_name, contact_number, party_size, event_date, reservation_time, table_id, status } = req.body;
+    const { customer_name, contact_number, party_size, event_date, reservation_time, table_id, status, customer_id } = req.body;
 
     try {
         // 1. Check kung existing yung reservation
@@ -110,29 +138,51 @@ const updateEventReservation = async (req, res) => {
         }
 
         // 5. Kung future date naman, ituloy ang update
-        const query = `
-            UPDATE event_reservations 
-            SET customer_name = COALESCE($1, customer_name),
-                contact_number = COALESCE($2, contact_number),
-                party_size = COALESCE($3, party_size),
-                event_date = COALESCE($4, event_date),
-                reservation_time = COALESCE($5, reservation_time),
-                table_id = COALESCE($6, table_id),
-                status = COALESCE($7, status)
-            WHERE id = $8
-            RETURNING *;
-        `;
+        const existingColumns = await pool.query(
+            `SELECT column_name
+               FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name = 'event_reservations'`
+        );
+        const hasCustomerIdColumn = existingColumns.rows.some(
+            (row) => row.column_name === 'customer_id'
+        );
 
-        const { rows } = await pool.query(query, [
+        const assignments = [
+            `customer_name = COALESCE($1, customer_name)`,
+            `contact_number = COALESCE($2, contact_number)`,
+            `party_size = COALESCE($3, party_size)`,
+            `event_date = COALESCE($4, event_date)`,
+            `reservation_time = COALESCE($5, reservation_time)`,
+            `table_id = COALESCE($6, table_id)`,
+            `status = COALESCE($7, status)`
+        ];
+        const params = [
             customer_name || null,
             contact_number || null,
             party_size || null,
             event_date || null,
             reservation_time || null,
             table_id || null,
-            status || null,
-            id
-        ]);
+            status || null
+        ];
+
+        if (hasCustomerIdColumn && customer_id !== null && customer_id !== undefined && String(customer_id).trim() !== '') {
+            params.push(customer_id);
+            assignments.push(`customer_id = $${params.length}`);
+        }
+
+        const wherePlaceholder = `$${params.length + 1}`;
+        params.push(id);
+
+        const query = `
+            UPDATE event_reservations
+            SET ${assignments.join(', ')}
+            WHERE id = ${wherePlaceholder}
+            RETURNING *;
+        `;
+
+        const { rows } = await pool.query(query, params);
 
         return res.status(200).json({
             success: true,
