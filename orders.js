@@ -23,10 +23,18 @@ const createOrder = async (req, res) => {
         notes
     } = req.body || {};
 
-    const tableId = Number(table_id);
-    const sessionId = session_id == null ? null : Number(session_id);
+    // Kapag verified online (Google) session, server-side ang table/session/
+    // customer — hindi puwedeng i-spoof ng client ang table_id.
+    const onlineSession = req.customerSession || null;
+
+    const tableId = onlineSession ? onlineSession.tableId : Number(table_id);
+    const sessionId = onlineSession
+        ? onlineSession.sessionId
+        : (session_id == null ? null : Number(session_id));
     const parentOrderId = parent_order_id == null ? null : Number(parent_order_id);
     const isAdditional = is_additional_order === true;
+    const customerId = onlineSession ? onlineSession.customerId : null;
+    const fulfillmentType = onlineSession ? 'TAKEOUT' : 'DINE_IN';
 
     // Special instructions / allergy note. Order-level, max 300 chars.
     const normalizedNotes = notes == null
@@ -43,7 +51,9 @@ const createOrder = async (req, res) => {
         items,
         notes: normalizedNotes,
         clientOrderId: idempotencyKey,
-        idempotencyKey
+        idempotencyKey,
+        customerId,
+        fulfillmentType
     });
 
     if (!result.ok) {
@@ -75,7 +85,11 @@ const createOrder = async (req, res) => {
             items: result.added_items,
             added_items: isAdditional ? result.added_items : [],
             is_additional_order: isAdditional,
-            message: `Order #${result.order.id} updated for Table #${result.order.table_id}`
+            fulfillment_type: fulfillmentType,
+            customer_id: customerId,
+            message: fulfillmentType === 'TAKEOUT'
+                ? `Takeout order #${result.order.id} updated`
+                : `Order #${result.order.id} updated for Table #${result.order.table_id}`
         });
 
         eventHub.emitStockUpdated({
@@ -87,7 +101,11 @@ const createOrder = async (req, res) => {
             items: result.added_items,
             added_items: isAdditional ? result.added_items : [],
             is_additional_order: isAdditional,
-            message: `Order #${result.order.id} updated for Table #${result.order.table_id}`
+            fulfillment_type: fulfillmentType,
+            customer_id: customerId,
+            message: fulfillmentType === 'TAKEOUT'
+                ? `Takeout order #${result.order.id} updated`
+                : `Order #${result.order.id} updated for Table #${result.order.table_id}`
         });
 
         if (isAdditional) {
@@ -100,7 +118,11 @@ const createOrder = async (req, res) => {
                 items: result.added_items,
                 added_items: result.added_items,
                 is_additional_order: isAdditional,
-                message: `Order #${result.order.id} updated for Table #${result.order.table_id}`
+                fulfillment_type: fulfillmentType,
+                customer_id: customerId,
+                message: fulfillmentType === 'TAKEOUT'
+                    ? `Takeout order #${result.order.id} updated`
+                    : `Order #${result.order.id} updated for Table #${result.order.table_id}`
             });
         }
     }
@@ -114,15 +136,18 @@ const createOrder = async (req, res) => {
         ? ` • NOTE: ${String(result.order.notes).replace(/\s+/g, ' ').slice(0, 60)}`
         : '';
     notificationService.sendStaffNotification({
-        title: isAdditional
-            ? `Additional Order — Table #${result.order.table_id}`
-            : `New Order — Table #${result.order.table_id}`,
+        title: fulfillmentType === 'TAKEOUT'
+            ? `New Takeout Order #${result.order.id}`
+            : (isAdditional
+                ? `Additional Order — Table #${result.order.table_id}`
+                : `New Order — Table #${result.order.table_id}`),
         body: `Order #${result.order.id}${itemCount > 0 ? ` • ${itemCount} item(s)` : ''}${totalAmount > 0 ? ` • ₱${totalAmount.toFixed(2)}` : ''}${notePreview}`,
         data: {
             type: isAdditional ? 'additional_order' : 'new_order',
             order_id: result.order.id,
             session_id: result.order.session_id,
             table_id: result.order.table_id,
+            fulfillment_type: fulfillmentType,
             is_additional: isAdditional ? '1' : '0'
         }
     }).catch((pushError) => {
@@ -514,10 +539,18 @@ const getOrders = async (req, res) => {
                     WHEN UPPER(ts.session_status) IN ('ACTIVE', 'OPEN')
                     THEN ts.bill_requested_at
                     ELSE NULL
-                END AS session_bill_requested_at
+                END AS session_bill_requested_at,
+                COALESCE(o.fulfillment_type, 'DINE_IN') AS fulfillment_type,
+                o.customer_id,
+                ca.email AS customer_email,
+                cp.given_name AS customer_given_name,
+                cp.family_name AS customer_family_name,
+                cp.avatar_url AS customer_avatar_url
             FROM orders o
             LEFT JOIN tables t ON o.table_id = t.id
             LEFT JOIN table_sessions ts ON o.session_id = ts.id
+            LEFT JOIN customer_accounts ca ON o.customer_id = ca.id
+            LEFT JOIN customer_profiles cp ON cp.customer_id = ca.id
             LEFT JOIN order_items oi ON o.id = oi.order_id
             LEFT JOIN menu_items m ON oi.menu_item_id = m.id
         `;
@@ -546,7 +579,9 @@ const getOrders = async (req, res) => {
             query += ` WHERE ` + conditions.join(' AND ');
         }
 
-        query += ` GROUP BY o.id, t.table_number, ts.session_status, ts.bill_requested_at, ts.closed_at ORDER BY o.created_at DESC;`;
+        query += ` GROUP BY o.id, t.table_number, ts.session_status, ts.bill_requested_at, ts.closed_at,
+                          o.fulfillment_type, o.customer_id, ca.email, cp.given_name, cp.family_name, cp.avatar_url
+                   ORDER BY o.created_at DESC;`;
 
         const { rows } = await pool.query(query, values);
 

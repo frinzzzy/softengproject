@@ -191,3 +191,58 @@ CREATE INDEX idx_orders_client_order_id ON orders(client_order_id);
 CREATE INDEX idx_orders_session_id ON orders(session_id);
 CREATE INDEX idx_reservations_time ON reservations(reservation_time);
 CREATE INDEX idx_assistance_status ON table_assistance_requests(status);
+
+-- 10. ONLINE (GOOGLE SIGN-IN) SUPPORT — additive at backward-compatible.
+-- Dine-in orders remain DINE_IN by default; online orders use a virtual table.
+CREATE TABLE IF NOT EXISTS customer_accounts (
+    id SERIAL PRIMARY KEY,
+    google_sub TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS customer_profiles (
+    customer_id INT PRIMARY KEY
+        REFERENCES customer_accounts(id) ON DELETE CASCADE,
+    given_name TEXT,
+    family_name TEXT,
+    avatar_url TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE tables
+    ADD COLUMN IF NOT EXISTS is_virtual BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS virtual_table_owners (
+    customer_id INT PRIMARY KEY
+        REFERENCES customer_accounts(id) ON DELETE CASCADE,
+    table_id INT UNIQUE NOT NULL
+        REFERENCES tables(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE orders
+    ADD COLUMN IF NOT EXISTS customer_id INT
+        REFERENCES customer_accounts(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS fulfillment_type VARCHAR(20)
+        NOT NULL DEFAULT 'DINE_IN';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'orders_fulfillment_type_check'
+    ) THEN
+        ALTER TABLE orders
+            ADD CONSTRAINT orders_fulfillment_type_check
+            CHECK (fulfillment_type IN ('DINE_IN', 'TAKEOUT'));
+    END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_orders_fulfillment_type
+    ON orders(fulfillment_type);
+CREATE INDEX IF NOT EXISTS idx_orders_customer_id
+    ON orders(customer_id);
+CREATE INDEX IF NOT EXISTS idx_tables_is_virtual
+    ON tables(is_virtual);

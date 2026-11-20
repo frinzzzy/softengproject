@@ -177,12 +177,16 @@ const createOrder = async ({
     items,
     notes,
     clientOrderId,
-    idempotencyKey
+    idempotencyKey,
+    customerId = null,
+    fulfillmentType = 'DINE_IN'
 }) => {
     const finalTableId = Number(tableId);
     const finalSessionId = sessionId == null ? null : Number(sessionId);
     const finalParentOrderId = parentOrderId == null ? null : Number(parentOrderId);
     const finalIsAdditional = isAdditional === true;
+    const finalCustomerId = customerId == null ? null : Number(customerId);
+    const finalFulfillmentType = fulfillmentType === 'TAKEOUT' ? 'TAKEOUT' : 'DINE_IN';
     // Order-level special instructions (allergy / requests). Optional.
     const finalNotes = notes == null
         ? null
@@ -494,8 +498,8 @@ const createOrder = async ({
                 targetOrder = parentRes.rows[0];
             } else {
                 const additionalOrderRes = await client.query(
-                    `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status, notes)
-                     VALUES ($1::int, $2::int, $3::int, TRUE, $4::uuid, $5::numeric, 'PENDING', $6::text)
+                    `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status, notes, customer_id, fulfillment_type)
+                     VALUES ($1::int, $2::int, $3::int, TRUE, $4::uuid, $5::numeric, 'PENDING', $6::text, $7::int, $8::text)
                      RETURNING *`,
                     [
                         targetSessionId,
@@ -503,22 +507,26 @@ const createOrder = async ({
                         parentOrderId,
                         crypto.randomUUID(),
                         additionalTotal,
-                        finalNotes
+                        finalNotes,
+                        finalCustomerId,
+                        finalFulfillmentType
                     ]
                 );
                 targetOrder = additionalOrderRes.rows[0];
             }
         } else {
             const newOrderRes = await client.query(
-                `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status, notes)
-                 VALUES ($1::int, $2::int, NULL, FALSE, $3::uuid, $4::numeric, 'PENDING', $5::text)
+                `INSERT INTO orders (session_id, table_id, parent_order_id, is_additional_order, client_order_id, total_amount, order_status, notes, customer_id, fulfillment_type)
+                 VALUES ($1::int, $2::int, NULL, FALSE, $3::uuid, $4::numeric, 'PENDING', $5::text, $6::int, $7::text)
                  RETURNING *`,
                 [
                     targetSessionId,
                     finalTableId,
                     finalClientOrderId,
                     additionalTotal,
-                    finalNotes
+                    finalNotes,
+                    finalCustomerId,
+                    finalFulfillmentType
                 ]
             );
             targetOrder = newOrderRes.rows[0];

@@ -15,6 +15,7 @@ if (!JWT_SECRET) {
 const authRoutes = require('./auth');
 const assistanceRoutes = require('./assistance');
 const adminStaffRoutes = require('./adminStaff');
+const { googleSignIn, attachCustomerSession } = require('./customerAuth');
 const { authenticateToken, authorizeRoles } = require('./authMiddleware');
 const { initStaffAuthSchema } = require('./staffAuthSchema');
 const { initOrderChecklistSchema } = require('./orderChecklistSchema');
@@ -385,7 +386,8 @@ app.post('/api/v1/dev/force-active-session', async (req, res) => {
   }
 });
 
-app.post('/api/v1/orders', createOrder);
+app.post('/api/v1/customer/auth/google', googleSignIn);
+app.post('/api/v1/orders', attachCustomerSession, createOrder);
 app.get('/api/v1/orders/unfinished', getUnfinishedOrders);
 app.get('/api/v1/orders/:id', getOrderById);
 app.get('/api/v1/tables/:table_id/bill', getTableSessionBill);
