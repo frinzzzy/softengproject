@@ -954,6 +954,12 @@ const updateOrderStatus = async (req, res) => {
     const { id } = req.params;
     const { status, decline_reason } = req.body;
 
+    // Cap ang decline reason sa column limit (VARCHAR(255)) para hindi bumagsak
+    // ang DB at maging consistent ang validation.
+    const normalizedDeclineReason = typeof decline_reason === 'string'
+        ? decline_reason.trim().slice(0, 255) || null
+        : decline_reason;
+
     const validStatuses = [
         'PENDING', 'PREPARING', 'READY', 'SERVED',
         'COMPLETED', 'PAID', 'CANCELLED', 'DECLINED'
@@ -968,7 +974,7 @@ const updateOrderStatus = async (req, res) => {
         });
     }
 
-    if (formattedStatus === 'DECLINED' && !decline_reason?.trim()) {
+    if (formattedStatus === 'DECLINED' && !(normalizedDeclineReason?.trim())) {
         return res.status(400).json({
             success: false,
             message: 'decline_reason is required when declining an order.'
@@ -978,7 +984,7 @@ const updateOrderStatus = async (req, res) => {
     const eventHub = req.app.get('event_hub');
 
     try {
-        const result = await orderService.updateOrderStatus(Number(id), formattedStatus, decline_reason);
+        const result = await orderService.updateOrderStatus(Number(id), formattedStatus, normalizedDeclineReason);
 
         if (result.notFound) {
             return res.status(404).json({
