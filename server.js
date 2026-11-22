@@ -425,6 +425,34 @@ app.delete(
   authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'),
   notificationService.unregisterStaffFcmToken
 );
+// Diagnostic + test push para ma-verify ang delivery at deep-link mula sa Admin UI.
+app.get(
+  '/api/v1/staff/fcm-token/status',
+  authenticateToken,
+  authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'),
+  async (req, res) => {
+    try {
+      res.status(200).json({ success: true, data: await notificationService.getStaffFcmStatus() });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+app.post(
+  '/api/v1/staff/fcm-token/test',
+  authenticateToken,
+  authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'),
+  async (req, res) => {
+    try {
+      const result = await notificationService.sendTestStaffNotification({
+        type: req.body?.type
+      });
+      res.status(200).json({ success: true, data: result });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
 app.patch('/api/v1/orders/:id/status', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN'), updateOrderStatus);
 app.patch('/api/v1/orders/:order_id/items/:item_id/check', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN'), setOrderItemChecked);
 app.post('/api/v1/orders/:id/pay', authenticateToken, authorizeRoles('ADMIN', 'CASHIER'), processOrderPayment);

@@ -300,11 +300,60 @@ const sendCustomerOrderPlacedNotification = async ({
     return { sent, failed };
 };
 
+/// Diagnostic para malaman kung naka-configure ang FCM at kung may naka-register
+/// na staff device — walang secrets na ibinabalik.
+const getStaffFcmStatus = async () => {
+    try {
+        await ensureStaffTokenTable();
+        const { rows } = await pool.query(
+            `SELECT COUNT(*)::int AS token_count FROM ${STAFF_TOKEN_TABLE}`
+        );
+        return {
+            fcmConfigured: isFcmConfigured(),
+            tokenCount: rows && rows[0] ? Number(rows[0].token_count) : 0
+        };
+    } catch (error) {
+        console.error('[FCM] Status check failed:', error.message);
+        return { fcmConfigured: isFcmConfigured(), tokenCount: 0, error: error.message };
+    }
+};
+
+/// Test push mula sa Admin UI para ma-verify agad ang delivery + deep-link.
+const sendTestStaffNotification = async ({ type = 'new_order' } = {}) => {
+    const normalized = String(type || 'new_order').toLowerCase();
+    const presets = {
+        new_order: {
+            title: 'TEST: New Order',
+            body: 'Ito ay test push. I-tap para pumunta sa Order Queue.',
+            data: { type: 'new_order', order_id: 'TEST', source: 'test' }
+        },
+        additional_order: {
+            title: 'TEST: Additional Order',
+            body: 'Ito ay test push. I-tap para pumunta sa Order Queue.',
+            data: { type: 'additional_order', order_id: 'TEST', source: 'test' }
+        },
+        low_stock: {
+            title: 'TEST: Low Stock',
+            body: 'Ito ay test push. I-tap para pumunta sa Low Stock.',
+            data: { type: 'low_stock', item_name: 'TEST ITEM', item_id: '0', source: 'test' }
+        },
+        bill_requested: {
+            title: 'TEST: Bill Requested',
+            body: 'Ito ay test push. I-tap para pumunta sa Bill.',
+            data: { type: 'bill_requested', order_id: 'TEST', source: 'test' }
+        }
+    };
+    const preset = presets[normalized] || presets.new_order;
+    return sendStaffNotification(preset);
+};
+
 module.exports = {
     isFcmConfigured,
     registerFcmToken,
     registerStaffFcmToken,
     unregisterStaffFcmToken,
+    getStaffFcmStatus,
+    sendTestStaffNotification,
     sendOrderStatusNotification,
     sendCustomerOrderPlacedNotification,
     sendStaffNotification

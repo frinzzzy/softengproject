@@ -166,20 +166,19 @@ const createOrder = async (req, res) => {
     // Customer FCM — "order received" notification para sa takeout (kill-app
     // reliable): kahit na naka-background/naka-kill ang app, makakakuha ng
     // notification ang customer na may matching session token.
-    try {
-        await notificationService.sendCustomerOrderPlacedNotification({
-            session_id: result.order.session_id,
-            table_id: result.order.table_id,
-            order_id: result.order.id,
-            fulfillment_type: fulfillmentType,
-            is_additional: isAdditional
-        });
-    } catch (customerPushError) {
+    // Fire-and-forget: huwag ipila ang response ng order sa FCM latency.
+    notificationService.sendCustomerOrderPlacedNotification({
+        session_id: result.order.session_id,
+        table_id: result.order.table_id,
+        order_id: result.order.id,
+        fulfillment_type: fulfillmentType,
+        is_additional: isAdditional
+    }).catch((customerPushError) => {
         console.error(
             '[FCM] Failed to send customer order-placed notification:',
             customerPushError && customerPushError.message ? customerPushError.message : customerPushError
         );
-    }
+    });
 
     // Gmail order ticket — ipadala ang customer (Google sign-in takeout) ang order
     // ticket sa kanilang verified email address. Best-effort lang; hindi bumabagsak
