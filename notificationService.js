@@ -227,11 +227,85 @@ const sendStaffNotification = async ({ title, body, data = {} }) => {
     }
 };
 
+const sendCustomerOrderPlacedNotification = async ({
+    session_id,
+    table_id,
+    order_id,
+    fulfillment_type,
+    is_additional
+} = {}) => {
+    if (!firebaseApp) return { sent: 0, failed: 0, skipped: true, reason: 'not_configured' };
+    if (!session_id) return { sent: 0, failed: 0, skipped: true, reason: 'no_session' };
+
+    const isAdditional = Boolean(is_additional);
+    const message = {
+        title: isAdditional
+            ? `Additional items received for Order #${order_id}`
+            : `Order received! #${order_id}`,
+        body: isAdditional
+            ? 'The kitchen has received the additional items for your order.'
+            : 'We received your order — the kitchen is now preparing it.'
+    };
+
+    const { rows } = await pool.query(
+        'SELECT token FROM customer_fcm_tokens WHERE session_id = $1::int AND token IS NOT NULL',
+        [session_id]
+    );
+    const tokens = [...new Set((rows || []).map((row) => row.token).filter(Boolean))];
+    if (tokens.length === 0) return { sent: 0, failed: 0, skipped: true, reason: 'no_tokens' };
+
+    const messaging = getMessaging(firebaseApp);
+    const invalidTokens = [];
+    let sent = 0;
+    let failed = 0;
+
+    for (let start = 0; start < tokens.length; start += 500) {
+        const batch = tokens.slice(start, start + 500);
+        const response = await messaging.sendEachForMulticast({
+            tokens: batch,
+            notification: message,
+            data: {
+                order_id: String(order_id ?? ''),
+                session_id: String(session_id ?? ''),
+                table_id: String(table_id ?? ''),
+                fulfillment_type: String(fulfillment_type || ''),
+                is_additional: isAdditional ? '1' : '0'
+            },
+            android: {
+                priority: 'high',
+                notification: {
+                    channelId: 'balai_silayan_orders_v2',
+                    icon: 'ic_stat_balai',
+                    sound: 'default'
+                }
+            }
+        });
+
+        sent += response.successCount;
+        failed += response.failureCount;
+        response.responses.forEach((result, index) => {
+            if (result.error?.code === 'messaging/registration-token-not-registered') {
+                invalidTokens.push(batch[index]);
+            }
+        });
+    }
+
+    if (invalidTokens.length > 0) {
+        await pool.query(
+            'DELETE FROM customer_fcm_tokens WHERE session_id = $1::int AND token = ANY($2::text[])',
+            [session_id, invalidTokens]
+        );
+    }
+
+    return { sent, failed };
+};
+
 module.exports = {
     isFcmConfigured,
     registerFcmToken,
     registerStaffFcmToken,
     unregisterStaffFcmToken,
     sendOrderStatusNotification,
+    sendCustomerOrderPlacedNotification,
     sendStaffNotification
 };

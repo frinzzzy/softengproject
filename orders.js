@@ -5,6 +5,7 @@ const orderService = require('./orderService');
 const paymentService = require('./paymentService');
 const notificationService = require('./notificationService');
 const billState = require('./billState');
+const emailService = require('./emailService');
 
 const logApiResponse = (endpoint, details) => {
     if (process.env.DEBUG_API_RESPONSES === 'true') {
@@ -34,7 +35,15 @@ const createOrder = async (req, res) => {
     const parentOrderId = parent_order_id == null ? null : Number(parent_order_id);
     const isAdditional = is_additional_order === true;
     const customerId = onlineSession ? onlineSession.customerId : null;
-    const fulfillmentType = onlineSession ? 'TAKEOUT' : 'DINE_IN';
+    // Online (Google) session -> automatically TAKEOUT (virtual table).
+    // Dine-in (QR) session -> default DINE_IN; the customer may override the
+    // fulfillment via checkout (Take Out / To-Go) while the physical
+    // table/session (hal. Table 5) is kept.
+    const fulfillmentType = onlineSession
+        ? 'TAKEOUT'
+        : (req.body && req.body.fulfillment_type === 'TAKEOUT'
+            ? 'TAKEOUT'
+            : 'DINE_IN');
 
     // Special instructions / allergy note. Order-level, max 300 chars.
     const normalizedNotes = notes == null
@@ -153,6 +162,42 @@ const createOrder = async (req, res) => {
     }).catch((pushError) => {
         console.error('[FCM] Failed to send staff new-order notification:', pushError.message);
     });
+
+    // Customer FCM — "order received" notification para sa takeout (kill-app
+    // reliable): kahit na naka-background/naka-kill ang app, makakakuha ng
+    // notification ang customer na may matching session token.
+    try {
+        await notificationService.sendCustomerOrderPlacedNotification({
+            session_id: result.order.session_id,
+            table_id: result.order.table_id,
+            order_id: result.order.id,
+            fulfillment_type: fulfillmentType,
+            is_additional: isAdditional
+        });
+    } catch (customerPushError) {
+        console.error(
+            '[FCM] Failed to send customer order-placed notification:',
+            customerPushError && customerPushError.message ? customerPushError.message : customerPushError
+        );
+    }
+
+    // Gmail order ticket — ipadala ang customer (Google sign-in takeout) ang order
+    // ticket sa kanilang verified email address. Best-effort lang; hindi bumabagsak
+    // ang order creation kung mag-fail ang email.
+    if (customerId) {
+        emailService
+            .sendOrderTicketEmail({
+                customerId,
+                orderId: result.order.id,
+                isAdditional
+            })
+            .catch((emailError) => {
+                console.error(
+                    '[Email] Failed to send order ticket for order ' + result.order.id + ':',
+                    emailError && emailError.message ? emailError.message : emailError
+                );
+            });
+    }
 
     return res.status(201).json({
         success: true,
