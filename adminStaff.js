@@ -13,6 +13,9 @@ const parseUserId = (value) => {
 
 const getPassword = (body) => body?.temp_password ?? body?.password;
 
+const normalizeFullName = (value) =>
+    typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+
 const validatePassword = (password) =>
     typeof password === 'string' && password.length >= 8 && password.length <= 128;
 
@@ -53,7 +56,7 @@ router.get('/', async (req, res) => {
 });
 
 router.post('/', async (req, res) => {
-    const fullName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const fullName = normalizeFullName(req.body?.name);
     const username = typeof req.body?.username === 'string' ? req.body.username.trim().toLowerCase() : '';
     const role = typeof req.body?.role === 'string' ? req.body.role.trim().toUpperCase() : '';
     const password = getPassword(req.body);
@@ -72,6 +75,19 @@ router.post('/', async (req, res) => {
     }
 
     try {
+        // Uniqueness ng pangalan: bawal ang dalawang account na pareho ang
+        // normalized full name (case-insensitive).
+        const duplicate = await pool.query(
+            `SELECT id FROM users WHERE lower(full_name) = lower($1) LIMIT 1`,
+            [fullName]
+        );
+        if (duplicate.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'An account with this name already exists.'
+            });
+        }
+
         const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
         const pinHash = pin == null ? null : await bcrypt.hash(pin, BCRYPT_ROUNDS);
         const { rows } = await pool.query(
@@ -92,7 +108,7 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
     const userId = parseUserId(req.params.id);
-    const fullName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const fullName = normalizeFullName(req.body?.name);
     const role = typeof req.body?.role === 'string' ? req.body.role.trim().toUpperCase() : '';
 
     if (!userId || !fullName || fullName.length > 100 || !VALID_ROLES.has(role)) {
@@ -117,6 +133,15 @@ router.patch('/:id', async (req, res) => {
         if (staff.is_active && staff.role === 'ADMIN' && role !== 'ADMIN' && await activeAdminCount(client) <= 1) {
             await client.query('ROLLBACK');
             return res.status(409).json({ success: false, message: 'Cannot demote the last active ADMIN.' });
+        }
+
+        const duplicate = await client.query(
+            `SELECT id FROM users WHERE lower(full_name) = lower($1) AND id <> $2::int LIMIT 1`,
+            [fullName, userId]
+        );
+        if (duplicate.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ success: false, message: 'An account with this name already exists.' });
         }
 
         const { rows } = await client.query(
@@ -263,6 +288,50 @@ router.post('/:id/activate', async (req, res) => {
     } catch (error) {
         console.error('[Admin Staff] Activation failed:', error.message);
         return res.status(500).json({ success: false, message: 'Failed to activate staff account.' });
+    }
+});
+
+// DELETE /api/v1/admin/staff/:id — permanent delete.
+// Kailangan ng ADMIN; hindi puwedeng i-delete ang sarili o ang huling active
+// ADMIN. Naka-CASCADE naman ang sessions/FCM tokens sa users table.
+router.delete('/:id', async (req, res) => {
+    const userId = parseUserId(req.params.id);
+    if (!userId) return res.status(400).json({ success: false, message: 'A valid staff id is required.' });
+    if (userId === Number(req.user.id)) {
+        return res.status(409).json({ success: false, message: 'You cannot delete your own account.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await lockAdminChanges(client);
+        const current = await client.query(
+            'SELECT id, role, is_active FROM users WHERE id = $1::int FOR UPDATE',
+            [userId]
+        );
+        if (current.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'Staff account not found.' });
+        }
+
+        const staff = current.rows[0];
+        if (staff.is_active && staff.role === 'ADMIN' && await activeAdminCount(client) <= 1) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ success: false, message: 'Cannot delete the last active ADMIN.' });
+        }
+
+        await client.query('DELETE FROM staff_sessions WHERE user_id = $1::int', [userId]);
+        await client.query('DELETE FROM users WHERE id = $1::int', [userId]);
+        await client.query('COMMIT');
+        return res.status(200).json({ success: true, message: 'Staff account deleted permanently.' });
+    } catch (error) {
+        try { await client.query('ROLLBACK'); } catch (rollbackError) {
+            console.error('[Admin Staff] Delete rollback failed:', rollbackError.message);
+        }
+        console.error('[Admin Staff] Delete failed:', error.message);
+        return res.status(500).json({ success: false, message: 'Failed to delete staff account.' });
+    } finally {
+        client.release();
     }
 });
 
