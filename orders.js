@@ -762,15 +762,30 @@ const getCustomerLiveOrders = async (req, res) => {
 /// COMPLETED/PAID na orders para hindi mawala ang notification/history kapag
 /// nag-settle na ang session (dahil ang /unfinished ay itinatapon na ang COMPLETED).
 const getRecentCustomerOrders = async (req, res) => {
-    const { session_id } = req.query;
-
-    const sessionIdNum = Number(session_id);
+    // Route params (secured) ang unahin; query param ang fallback para sa
+    // legacy clients. Both ay dumaaan na sa authenticateSessionToken.
+    const sessionIdRaw = req.params?.session_id ?? req.query?.session_id;
+    const sessionIdNum = Number(sessionIdRaw);
     if (!Number.isSafeInteger(sessionIdNum) || sessionIdNum <= 0) {
         return res.status(400).json({
             success: false,
             message: 'A valid session_id is required.'
         });
     }
+
+    // Google takeout tokens may carry customer_id. Parishan lahat ng orders
+    // ng customer (kahit na ibang session na) para talagang "past orders" ang
+    // makikita. QR sessions naman ay session-scoped.
+    const claims = req.tableSessionClaims || {};
+    const customerId = Number(claims.customer_id);
+    const hasCustomerScope =
+        Number.isSafeInteger(customerId) && customerId > 0;
+    const whereClause = hasCustomerScope
+        ? 'o.customer_id = $2::int'
+        : 'o.session_id = $1::int';
+    const params = hasCustomerScope
+        ? [sessionIdNum, customerId]
+        : [sessionIdNum];
 
     try {
         const query = `
@@ -779,6 +794,7 @@ const getRecentCustomerOrders = async (req, res) => {
                 o.id,
                 o.session_id,
                 o.table_id,
+                o.customer_id,
                 o.parent_order_id,
                 COALESCE(o.is_additional_order, FALSE) AS is_additional_order,
                 CASE
@@ -786,6 +802,7 @@ const getRecentCustomerOrders = async (req, res) => {
                     THEN 'ADDITIONAL'
                     ELSE 'NEW'
                 END AS order_type,
+                COALESCE(o.fulfillment_type, 'DINE_IN') AS fulfillment_type,
                 COALESCE(t.table_number, o.table_id) AS table_number,
                 o.total_amount,
                 o.order_status,
@@ -809,13 +826,13 @@ const getRecentCustomerOrders = async (req, res) => {
             LEFT JOIN tables t ON o.table_id = t.id
             LEFT JOIN order_items oi ON o.id = oi.order_id
             LEFT JOIN menu_items m ON oi.menu_item_id = m.id
-            WHERE o.session_id = $1::int
+            WHERE ${whereClause}
             GROUP BY o.id, t.table_number
             ORDER BY o.created_at DESC
-            LIMIT 20;
+            LIMIT 50;
         `;
 
-        const { rows } = await pool.query(query, [sessionIdNum]);
+        const { rows } = await pool.query(query, params);
 
         return res.status(200).json({
             success: true,

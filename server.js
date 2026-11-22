@@ -23,6 +23,7 @@ const { initOrderChecklistSchema } = require('./orderChecklistSchema');
 const eventHub = require('./eventHub');
 const notificationService = require('./notificationService');
 const { initBillState } = require('./billState');
+const emailService = require('./emailService');
 
 const { 
   createEventReservation, 
@@ -117,6 +118,15 @@ const logAuthDebug = (event, details) => {
 const getBearerToken = (authorizationHeader) => {
   if (typeof authorizationHeader !== 'string') return null;
   return authorizationHeader.match(/^Bearer\s+(\S+)\s*$/i)?.[1] || null;
+};
+
+// Ang legacy recent-orders route ay query-param ang session_id. Kopyahin ito
+// sa params bago ang token validation para iisang middleware ang gamit.
+const sessionIdFromQuery = (req, res, next) => {
+  if (req.params.session_id == null && req.query.session_id != null) {
+    req.params.session_id = req.query.session_id;
+  }
+  return next();
 };
 
 const authenticateSessionToken = (req, res, next) => {
@@ -259,6 +269,35 @@ app.get('/', (req, res) => {
   res.json({ message: 'LMCO Backend Engine active.' });
 });
 
+/// Phone-friendly ticket page na nililink sa Gmail ticket. Signed ang token
+/// (HMAC + expiry) kaya hindi kailangan ng login, pero hindi rin ito
+/// brute-forceable. Best-effort lang — hindi nito binabago ang order.
+app.get('/t/:token', async (req, res) => {
+  const errorPage = (status, message) => res.status(status).type('html').send(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8" />` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1" />` +
+    `<title>Ticket - Balai Silayan</title></head>` +
+    `<body style="margin:0;padding:24px;background:#f8f4ec;font-family:Arial,sans-serif;color:#203F35;">` +
+    `<div style="max-width:480px;margin:0 auto;background:#fffdfa;border:1px solid #e5dccb;` +
+    `border-radius:12px;padding:24px;text-align:center;">` +
+    `<h2 style="margin-top:0;">${message}</h2>` +
+    `<p style="font-size:13px;color:#788078;">Please show the original ticket email to the staff, ` +
+    `or open the app to view your orders.</p></div></body></html>`
+  );
+
+  const orderId = emailService.verifyTicketToken(req.params.token);
+  if (!orderId) return errorPage(403, 'Invalid or expired ticket link.');
+
+  try {
+    const bundle = await emailService.fetchOrderTicketBundle(orderId);
+    if (!bundle) return errorPage(404, 'Ticket not found.');
+    return res.status(200).type('html').send(emailService.buildTicketPageHtml({ bundle }));
+  } catch (error) {
+    console.error('[Ticket Page] Failed to render:', error.message);
+    return errorPage(500, 'Unable to load this ticket right now.');
+  }
+});
+
 app.get('/api/session/scan/:qr_token', async (req, res) => {
   const { qr_token } = req.params;
 
@@ -397,7 +436,19 @@ app.post('/api/v1/orders/:order_id/bill/reopen', authenticateToken, authorizeRol
 app.get('/api/v1/orders', authenticateToken, authorizeRoles('ADMIN', 'WAITER', 'KITCHEN', 'CASHIER'), getOrders);
 
 app.get('/api/v1/customer/orders/live', getCustomerLiveOrders);
-app.get('/api/v1/customer/orders/recent', getRecentCustomerOrders);
+// Hindi na pwedeng basahin ng sinuman ang order history ng ibang session.
+// Ang token ay table_session JWT ng session mismo (o ng Google takeout).
+app.get(
+  '/api/v1/customer/orders/recent',
+  sessionIdFromQuery,
+  authenticateSessionToken,
+  getRecentCustomerOrders
+);
+app.get(
+  '/api/v1/customer/sessions/:session_id/orders/recent',
+  authenticateSessionToken,
+  getRecentCustomerOrders
+);
 
 app.get('/api/v1/customer/sessions/:session_id/orders/:order_id', authenticateSessionToken, touchAuthenticatedSession, getSessionOrder);
 app.get('/api/v1/customer/sessions/:session_id/orders-summary', authenticateSessionToken, touchAuthenticatedSession, getSessionOrdersSummary);

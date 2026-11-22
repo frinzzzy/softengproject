@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const pool = require('./db');
 
 let nodemailer = null;
@@ -58,6 +59,82 @@ const formatDateTime = (iso) => {
     });
 };
 
+/// ---------------------------------------------------------------------------
+/// Signed "View ticket" link
+/// ---------------------------------------------------------------------------
+/// Hindi ito nangangailangan ng bagong hosting — nasa iisang Express app ang
+/// /t/:token route. JWT_SECRET ang fallback kung walang espesipikong secret,
+/// kaya walang bagong env var na kailangang i-set para gumana.
+const TICKET_LINK_TTL_SECONDS = 365 * 24 * 60 * 60; // 1 taon
+
+const base64UrlEncode = (value) =>
+    Buffer.from(value)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+const base64UrlDecode = (value) =>
+    Buffer.from(String(value).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+
+const getTicketLinkSecret = () => getEnv('TICKET_LINK_SECRET') || getEnv('JWT_SECRET');
+
+const signTicketToken = (orderId) => {
+    const secret = getTicketLinkSecret();
+    if (!secret) return null;
+    const payload = base64UrlEncode(JSON.stringify({
+        oid: Number(orderId),
+        exp: Math.floor(Date.now() / 1000) + TICKET_LINK_TTL_SECONDS
+    }));
+    const signature = crypto
+        .createHmac('sha256', secret)
+        .update(payload)
+        .digest('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    return `${payload}.${signature}`;
+};
+
+const verifyTicketToken = (token) => {
+    const secret = getTicketLinkSecret();
+    if (!secret || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+
+    const [payload, signature] = parts;
+    const expected = crypto
+        .createHmac('sha256', secret)
+        .update(payload)
+        .digest('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+    const receivedBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expected);
+    if (receivedBuffer.length !== expectedBuffer.length) return null;
+    if (!crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) return null;
+
+    try {
+        const claims = JSON.parse(base64UrlDecode(payload));
+        const orderId = Number(claims.oid);
+        const expiresAt = Number(claims.exp);
+        if (!Number.isSafeInteger(orderId) || orderId <= 0) return null;
+        if (!Number.isFinite(expiresAt) || expiresAt < Math.floor(Date.now() / 1000)) return null;
+        return orderId;
+    } catch (_) {
+        return null;
+    }
+};
+
+const buildViewTicketUrl = (orderId) => {
+    const token = signTicketToken(orderId);
+    if (!token) return null;
+    const base = getEnv('PUBLIC_BASE_URL') || 'https://softengproject.onrender.com';
+    return `${base.replace(/\/+$/, '')}/t/${token}`;
+};
+
 const fetchOrderTicket = async (orderId) => {
     const orderRes = await pool.query(
         `SELECT
@@ -67,6 +144,7 @@ const fetchOrderTicket = async (orderId) => {
             o.notes,
             o.created_at,
             o.is_additional_order,
+            o.parent_order_id,
             COALESCE(t.table_number, o.table_id) AS table_number,
             COALESCE(o.fulfillment_type, 'DINE_IN') AS fulfillment_type,
             ca.email AS customer_email,
@@ -184,7 +262,7 @@ const buildTicketText = ({ order, items, isAdditional }) => {
     return lines.join('\n');
 };
 
-const buildTicketHtml = ({ order, items, isAdditional }) => {
+const buildTicketHtml = ({ order, items, isAdditional, viewTicketUrl }) => {
     const pickupDetails = getPickupDetails();
     const itemRows = items
         .map((item) => {
@@ -238,10 +316,6 @@ const buildTicketHtml = ({ order, items, isAdditional }) => {
             </tr>
             ${order.table_number ? `<tr><td style="padding: 4px 0;">Table</td><td style="text-align: right;">${escapeHtml(String(order.table_number))}</td></tr>` : ''}
             <tr>
-                <td style="padding: 4px 0;">Pickup</td>
-                <td style="text-align: right;">${escapeHtml(pickupDetails.address)}</td>
-            </tr>
-            <tr>
                 <td style="padding: 4px 0;"><b>Total</b></td>
                 <td style="text-align: right;"><b>${formatPeso(order.total_amount)}</b></td>
             </tr>
@@ -254,7 +328,16 @@ const buildTicketHtml = ({ order, items, isAdditional }) => {
             ${pickupDetails.phone ? ` • Contact: ${escapeHtml(pickupDetails.phone)}` : ''}
         </p>
         <p style="font-size: 12px; margin-top: 4px;">${escapeHtml(pickupDetails.instructions)}</p>
-        <p style="font-size: 12px; margin-top: 24px;">Please show this ticket / order code to the staff during pickup.</p>
+        ${viewTicketUrl
+            ? `<p style="margin-top: 16px; text-align: center;">
+                <a href="${escapeHtml(viewTicketUrl)}"
+                   style="display: inline-block; background: #203F35; color: #ffffff; text-decoration: none;
+                          padding: 11px 20px; border-radius: 10px; font-size: 14px; font-weight: bold;">
+                   View ticket
+                </a>
+               </p>`
+            : ''}
+        <p style="font-size: 12px; margin-top: 16px; text-align: center;">Please show this ticket / order code to the staff during pickup.</p>
         <style>
             @media screen and (max-width: 480px) {
                 .ticket-container { width: 100% !important; max-width: 100% !important; }
@@ -264,6 +347,68 @@ const buildTicketHtml = ({ order, items, isAdditional }) => {
             }
         </style>
     </div>`;
+};
+
+/// Buong pickup ticket: parent order + lahat ng additional orders. Kaya kapag
+/// "additional items" ang email, makikita pa rin ang buong ticket sa page.
+const fetchOrderTicketBundle = async (orderId) => {
+    const requested = await fetchOrderTicket(orderId);
+    if (!requested) return null;
+
+    const parentId = Number(requested.order.parent_order_id);
+    const hasParent = Number.isSafeInteger(parentId) && parentId > 0;
+    const rootId = hasParent ? parentId : Number(requested.order.id);
+    const root = hasParent ? await fetchOrderTicket(rootId) : requested;
+    const orders = root ? [root] : [requested];
+
+    try {
+        const additionsRes = await pool.query(
+            `SELECT id FROM orders WHERE parent_order_id = $1::int ORDER BY id ASC`,
+            [rootId]
+        );
+        for (const row of additionsRes.rows) {
+            const addId = Number(row.id);
+            if (orders.some((entry) => Number(entry.order.id) === addId)) continue;
+            const addition = await fetchOrderTicket(addId);
+            if (addition) orders.push(addition);
+        }
+    } catch (error) {
+        console.warn('[Email] Could not load additional tickets for page:', error.message);
+    }
+
+    return {
+        rootId,
+        orders,
+        customerEmail: requested.customerEmail || root?.customerEmail || null
+    };
+};
+
+const buildTicketPageHtml = ({ bundle }) => {
+    const rootId = Number(bundle.rootId);
+    const cards = bundle.orders
+        .map((entry) => buildTicketHtml({
+            order: entry.order,
+            items: entry.items,
+            isAdditional: Number(entry.order.id) !== rootId
+        }))
+        .join('<div style="height: 14px;"></div>');
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ticket ${escapeHtml(formatOrderCode(rootId))} - Balai Silayan</title>
+</head>
+<body style="margin: 0; padding: 16px; background: #f8f4ec;">
+    <div style="max-width: 600px; margin: 0 auto;">
+        ${cards}
+        <p style="text-align: center; font-size: 12px; color: #788078; margin: 18px 0 0;">
+            Balai Silayan Heritage Restaurant • Show this ticket at pickup
+        </p>
+    </div>
+</body>
+</html>`;
 };
 
 /// Ipinapadala ang order ticket sa customer (Google sign-in email). Best-effort —
@@ -290,21 +435,24 @@ const sendOrderTicketEmail = async ({ customerId, orderId, isAdditional }) => {
             ? `Additional Items Ticket - ${formatOrderCode(order.id)} - Balai Silayan`
             : `Order Ticket #${formatOrderCode(order.id)} - Balai Silayan`;
 
+        const viewTicketUrl = buildViewTicketUrl(order.id);
         const text = buildTicketText({
             order,
             items: ticket.items,
             isAdditional: Boolean(isAdditional)
         });
+        const fullText = viewTicketUrl ? `${text}\n\nView ticket: ${viewTicketUrl}` : text;
 
         const info = await transporterInstance.sendMail({
             from: `"Balai Silayan" <${getEnv('GMAIL_USER')}>`,
             to: customerEmail,
             subject,
-            text,
+            text: fullText,
             html: buildTicketHtml({
                 order,
                 items: ticket.items,
-                isAdditional: Boolean(isAdditional)
+                isAdditional: Boolean(isAdditional),
+                viewTicketUrl
             })
         });
 
@@ -320,5 +468,9 @@ const sendOrderTicketEmail = async ({ customerId, orderId, isAdditional }) => {
 
 module.exports = {
     isEmailConfigured,
-    sendOrderTicketEmail
+    sendOrderTicketEmail,
+    verifyTicketToken,
+    fetchOrderTicketBundle,
+    buildTicketPageHtml,
+    buildViewTicketUrl
 };
