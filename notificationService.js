@@ -2,6 +2,147 @@ const pool = require('./db');
 const { getMessaging } = require('firebase-admin/messaging');
 const { firebaseApp } = require('./firebaseAdmin');
 
+const STAFF_TOKEN_TABLE = 'staff_fcm_tokens';
+const CUSTOMER_TOKEN_TABLE = 'customer_fcm_tokens';
+let staffTokenTableReady = null;
+/// Isang device = isang role sa isang pagkakataon. Kapag nag-register ang
+/// device bilang customer, tanggalin ang staff/admin row ng parehong FCM
+/// token para hindi ito makasagap ng admin alerts habang nasa customer app.
+const removeStaffTokenForDevice = async (token) => {
+    try {
+        await pool.query(
+            `DELETE FROM ${STAFF_TOKEN_TABLE} WHERE token = $1`,
+            [token]
+        );
+    } catch (_) {
+        // Baka wala pang staff token table (bagong deploy) — safe lang.
+    }
+};
+
+/// Kabaligtaran: kapag admin/staff ang nag-register, alisin ang customer
+/// registration ng parehong token para wala nang customer push sa device na
+/// ito habang naka-admin.
+const removeCustomerTokenForDevice = async (token) => {
+    try {
+        await ensureCustomerTokenTable();
+        await pool.query(
+            `DELETE FROM ${CUSTOMER_TOKEN_TABLE} WHERE token = $1`,
+            [token]
+        );
+    } catch (_) {
+        // Best-effort — hindi dapat harangin ang staff registration.
+    }
+};
+
+/// Self-heal para sa legacy na `customer_fcm_tokens` schema. Sa lumang DB,
+/// ang table ay `(customer_id, fcm_token)` — kaya lahat ng customer push
+/// registration ay nag-500 at walang customer notification na gumagana.
+/// Ginagawa itong `(session_id, token)` schema na inaasahan ng code.
+let customerTokenTableReady = null;
+const ensureCustomerTokenTable = async () => {
+    if (!customerTokenTableReady) {
+        customerTokenTableReady = (async () => {
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS ${CUSTOMER_TOKEN_TABLE} (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id INT,
+                    token TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
+
+            const { rows } = await pool.query(
+                `SELECT
+                    BOOL_OR(column_name = 'session_id') AS has_session,
+                    BOOL_OR(column_name = 'token') AS has_token,
+                    BOOL_OR(column_name = 'fcm_token') AS has_legacy_token,
+                    BOOL_OR(column_name = 'customer_id') AS has_customer
+                   FROM information_schema.columns
+                  WHERE table_schema = current_schema()
+                    AND table_name = $1`,
+                [CUSTOMER_TOKEN_TABLE]
+            );
+            const info = rows[0] || {};
+
+            if (info.has_legacy_token && !info.has_token) {
+                await pool.query(
+                    `ALTER TABLE ${CUSTOMER_TOKEN_TABLE} RENAME COLUMN fcm_token TO token`
+                );
+            }
+            if (!info.has_session) {
+                await pool.query(
+                    `ALTER TABLE ${CUSTOMER_TOKEN_TABLE} ADD COLUMN IF NOT EXISTS session_id INT`
+                );
+            }
+            if (!info.has_token) {
+                await pool.query(
+                    `ALTER TABLE ${CUSTOMER_TOKEN_TABLE} ADD COLUMN IF NOT EXISTS token TEXT`
+                );
+            }
+            if (info.has_customer) {
+                // Legacy NOT NULL constraint — hindi na ito kailangan.
+                await pool.query(
+                    `ALTER TABLE ${CUSTOMER_TOKEN_TABLE} ALTER COLUMN customer_id DROP NOT NULL`
+                );
+                // Ang lumang row na walang session_id ay hindi na magagamit sa
+                // session-scoped push. Ligtas itong alisin.
+                await pool.query(
+                    `DELETE FROM ${CUSTOMER_TOKEN_TABLE} WHERE session_id IS NULL`
+                );
+            }
+
+            // Legacy unique(token) ay pumipigil sa parehong device sa iba't
+            // ibang session. Palitan ng composite unique(session_id, token).
+            await pool.query(`
+                DO $$
+                DECLARE c record;
+                BEGIN
+                    FOR c IN
+                        SELECT conname, pg_get_constraintdef(oid) AS def
+                          FROM pg_constraint
+                         WHERE conrelid = '${CUSTOMER_TOKEN_TABLE}'::regclass
+                           AND contype = 'u'
+                    LOOP
+                        IF c.def NOT LIKE '%session_id%' THEN
+                            EXECUTE format(
+                                'ALTER TABLE ${CUSTOMER_TOKEN_TABLE} DROP CONSTRAINT %I',
+                                c.conname
+                            );
+                        END IF;
+                    END LOOP;
+                END $$;
+            `);
+            await pool.query(`
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                         WHERE conrelid = '${CUSTOMER_TOKEN_TABLE}'::regclass
+                           AND conname = 'uq_customer_fcm_tokens_session_token'
+                    ) THEN
+                        ALTER TABLE ${CUSTOMER_TOKEN_TABLE}
+                            ADD CONSTRAINT uq_customer_fcm_tokens_session_token
+                            UNIQUE (session_id, token);
+                    END IF;
+                END $$;
+            `);
+            await pool.query(
+                `CREATE INDEX IF NOT EXISTS idx_customer_fcm_tokens_session_id
+                    ON ${CUSTOMER_TOKEN_TABLE}(session_id)`
+            );
+            await pool.query(
+                `CREATE INDEX IF NOT EXISTS idx_customer_fcm_tokens_token
+                    ON ${CUSTOMER_TOKEN_TABLE}(token)`
+            );
+        })().catch((error) => {
+            customerTokenTableReady = null;
+            throw error;
+        });
+    }
+    return customerTokenTableReady;
+};
+
 const STATUS_NOTIFICATION_MESSAGES = {
     PREPARING: { title: 'Order is being prepared!', body: 'The kitchen started preparing your order.' },
     READY: { title: 'Your order is READY!', body: 'Please proceed to pickup.' },
@@ -23,6 +164,7 @@ const registerFcmToken = async (req, res) => {
     }
 
     try {
+        await ensureCustomerTokenTable();
         await pool.query(
             `INSERT INTO customer_fcm_tokens (session_id, token)
              VALUES ($1::int, $2)
@@ -30,6 +172,9 @@ const registerFcmToken = async (req, res) => {
              DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
             [sessionId, token.trim()]
         );
+        // Kung admin device dati ang phone na ito, alisin ang staff row para
+        // hindi na tumanggap ng admin notifications sa customer APK.
+        await removeStaffTokenForDevice(token.trim());
         return res.status(200).json({ success: true, session_id: sessionId });
     } catch (error) {
         console.error('[FCM] Token registration failed:', error.message);
@@ -46,6 +191,7 @@ const sendOrderStatusNotification = async ({ session_id, table_id, order_id, sta
         title: `Order #${order_id} update`,
         body: 'There is an update on your order.'
     };
+    await ensureCustomerTokenTable();
     const { rows } = await pool.query(
         'SELECT token FROM customer_fcm_tokens WHERE session_id = $1::int AND token IS NOT NULL',
         [session_id]
@@ -62,8 +208,12 @@ const sendOrderStatusNotification = async ({ session_id, table_id, order_id, sta
         const batch = tokens.slice(start, start + 500);
         const response = await messaging.sendEachForMulticast({
             tokens: batch,
-            notification: message,
+            // Data-only para tumakbo ang Flutter background handler kahit
+            // killed/background ang app — doon natin nire-record sa history
+            // bago i-display ang local notification.
             data: {
+                title: message.title,
+                body: message.body,
                 type: 'order_status',
                 order_id: String(order_id ?? ''),
                 session_id: String(session_id ?? ''),
@@ -71,12 +221,7 @@ const sendOrderStatusNotification = async ({ session_id, table_id, order_id, sta
                 status: normalizedStatus
             },
             android: {
-                priority: 'high',
-                notification: {
-                    channelId: 'balai_silayan_orders_v2',
-                    icon: 'ic_stat_balai',
-                    sound: 'default'
-                }
+                priority: 'high'
             }
         });
 
@@ -98,9 +243,6 @@ const sendOrderStatusNotification = async ({ session_id, table_id, order_id, sta
 
     return { sent, failed };
 };
-
-const STAFF_TOKEN_TABLE = 'staff_fcm_tokens';
-let staffTokenTableReady = null;
 
 // Siguraduhing existing ang staff token table kahit nakalimutan i-run ang
 // migration sa deployment. Isang beses lang ito tumatakbo bawat process.
@@ -148,6 +290,9 @@ const registerStaffFcmToken = async (req, res) => {
                            updated_at = CURRENT_TIMESTAMP`,
             [userId, token.trim(), role]
         );
+        // Alisin ang customer registration ng parehong device para hindi na
+        // ito makakuha ng customer pushes habang naka-admin login.
+        await removeCustomerTokenForDevice(token.trim());
         return res.status(200).json({ success: true });
     } catch (error) {
         console.error('[FCM] Staff token registration failed:', error.message);
@@ -181,8 +326,17 @@ const sendStaffNotification = async ({ title, body, data = {} }) => {
 
     try {
         await ensureStaffTokenTable();
+        // Iwasan ang pagpapadala ng admin alerts sa device na kasalukuyang
+        // naka-register bilang customer (customer APK). Kahit may stale staff
+        // row na naiwan mula sa dating admin test, hindi na ito padadalhan.
         const { rows } = await pool.query(
-            `SELECT token FROM ${STAFF_TOKEN_TABLE} WHERE token IS NOT NULL`
+            `SELECT s.token
+               FROM ${STAFF_TOKEN_TABLE} s
+              WHERE s.token IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM ${CUSTOMER_TOKEN_TABLE} c
+                     WHERE c.token = s.token
+                )`
         );
         const tokens = [...new Set((rows || []).map((row) => row.token).filter(Boolean))];
         if (tokens.length === 0) return { sent: 0, failed: 0, skipped: true, reason: 'no_tokens' };
@@ -256,6 +410,7 @@ const sendCustomerOrderPlacedNotification = async ({
             : 'We received your order — the kitchen is now preparing it.'
     };
 
+    await ensureCustomerTokenTable();
     const { rows } = await pool.query(
         'SELECT token FROM customer_fcm_tokens WHERE session_id = $1::int AND token IS NOT NULL',
         [session_id]
@@ -272,8 +427,11 @@ const sendCustomerOrderPlacedNotification = async ({
         const batch = tokens.slice(start, start + 500);
         const response = await messaging.sendEachForMulticast({
             tokens: batch,
-            notification: message,
+            // Data-only din: kailangan itong pumasok sa background handler
+            // para ma-save sa notification history kahit patay ang app.
             data: {
+                title: message.title,
+                body: message.body,
                 type: isAdditional ? 'additional_order' : 'new_order',
                 order_id: String(order_id ?? ''),
                 session_id: String(session_id ?? ''),
@@ -282,12 +440,7 @@ const sendCustomerOrderPlacedNotification = async ({
                 is_additional: isAdditional ? '1' : '0'
             },
             android: {
-                priority: 'high',
-                notification: {
-                    channelId: 'balai_silayan_orders_v2',
-                    icon: 'ic_stat_balai',
-                    sound: 'default'
-                }
+                priority: 'high'
             }
         });
 
