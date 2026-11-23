@@ -293,8 +293,23 @@ app.get('/t/:token', async (req, res) => {
     if (!bundle) return errorPage(404, 'Ticket not found.');
     return res.status(200).type('html').send(emailService.buildTicketPageHtml({ bundle }));
   } catch (error) {
-    console.error('[Ticket Page] Failed to render:', error.message);
-    return errorPage(500, 'Unable to load this ticket right now.');
+    console.error('[Ticket Page] Failed to render:', error.message, error.stack || '');
+    // Huwag i-500 nang walang kapaki-pakinabang na info — ipakita ang order
+    // code at payagan ang retry, para may magamit pa rin ang customer.
+    const code = `#BS-${String(orderId).padStart(4, '0')}`;
+    return res.status(500).type('html').send(
+      `<!doctype html><html lang="en"><head><meta charset="utf-8" />` +
+      `<meta name="viewport" content="width=device-width, initial-scale=1" />` +
+      `<title>Ticket ${code} - Balai Silayan</title></head>` +
+      `<body style="margin:0;padding:24px;background:#f8f4ec;font-family:Arial,sans-serif;color:#203F35;">` +
+      `<div style="max-width:480px;margin:0 auto;background:#fffdfa;border:1px solid #e5dccb;` +
+      `border-radius:12px;padding:24px;text-align:center;">` +
+      `<h2 style="margin-top:0;">Order ${code}</h2>` +
+      `<p style="font-size:14px;">Hindi ma-load nang buo ang ticket ngayon. ` +
+      `Ipakita na lang ang order code na ito sa staff.</p>` +
+      `<p><a href="" style="color:#203F35;font-weight:bold;">Subukan muli</a></p>` +
+      `</div></body></html>`
+    );
   }
 });
 

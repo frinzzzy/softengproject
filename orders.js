@@ -780,12 +780,14 @@ const getRecentCustomerOrders = async (req, res) => {
     const customerId = Number(claims.customer_id);
     const hasCustomerScope =
         Number.isSafeInteger(customerId) && customerId > 0;
+    // Mahalaga: isang placeholder lang ($1) ang aktwal na ginagamit sa WHERE.
+    // Dati, $2 ang customer-scoped clause pero may unused $1 sa params — kaya
+    // PostgreSQL ay nag-throw ng "could not determine data type of parameter $1"
+    // at 500 ang Google takeout tickets.
     const whereClause = hasCustomerScope
-        ? 'o.customer_id = $2::int'
+        ? 'o.customer_id = $1::int'
         : 'o.session_id = $1::int';
-    const params = hasCustomerScope
-        ? [sessionIdNum, customerId]
-        : [sessionIdNum];
+    const params = hasCustomerScope ? [customerId] : [sessionIdNum];
 
     try {
         const query = `

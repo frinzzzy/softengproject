@@ -383,12 +383,30 @@ const fetchOrderTicketBundle = async (orderId) => {
     };
 };
 
+/// Isang card lang ang pwedeng mag-fail sa data; huwag nating hayaang maging
+/// buong-500 ang ticket page. Kapag may error, simpleng fallback card lang.
+const buildSafeTicketCard = ({ entry, isAdditional }) => {
+    try {
+        return buildTicketHtml({
+            order: entry.order,
+            items: Array.isArray(entry.items) ? entry.items : [],
+            isAdditional
+        });
+    } catch (error) {
+        console.error('[Email] Ticket card render failed:', error.message);
+        const orderId = entry && entry.order ? entry.order.id : null;
+        return `<div style="font-family: Arial, Helvetica, sans-serif; color: #203F35; width: 100%; max-width: 560px; margin: 0 auto; padding: 24px; border: 1px solid #e5dccb; border-radius: 12px; box-sizing: border-box;">
+            <h2 style="margin: 0;">Order ${escapeHtml(formatOrderCode(orderId))}</h2>
+            <p style="font-size: 14px;">Hindi ma-render nang buo ang ticket ngayon. Ipakita na lang ang order code sa staff.</p>
+        </div>`;
+    }
+};
+
 const buildTicketPageHtml = ({ bundle }) => {
     const rootId = Number(bundle.rootId);
     const cards = bundle.orders
-        .map((entry) => buildTicketHtml({
-            order: entry.order,
-            items: entry.items,
+        .map((entry) => buildSafeTicketCard({
+            entry,
             isAdditional: Number(entry.order.id) !== rootId
         }))
         .join('<div style="height: 14px;"></div>');
