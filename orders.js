@@ -1089,19 +1089,23 @@ const updateOrderStatus = async (req, res) => {
         }
 
         if (result.previousStatus !== result.order.order_status) {
-            try {
-                const pushResult = await notificationService.sendOrderStatusNotification({
+            // Best-effort at hindi hinihintay: huwag i-block ang status response
+            // sa FCM network call. Naka-log pa rin ang resulta.
+            notificationService
+                .sendOrderStatusNotification({
                     session_id: result.order.session_id,
                     table_id: result.order.table_id,
                     order_id: result.order.id,
                     status: result.order.order_status
+                })
+                .then((pushResult) => {
+                    if (pushResult.sent > 0) {
+                        console.log(`[FCM] Push sent for Order #${result.order.id} (${result.order.order_status})`);
+                    }
+                })
+                .catch((pushError) => {
+                    console.error('[FCM] Failed to send order status notification:', pushError.message);
                 });
-                if (pushResult.sent > 0) {
-                    console.log(`[FCM] Push sent for Order #${result.order.id} (${result.order.order_status})`);
-                }
-            } catch (pushError) {
-                console.error('[FCM] Failed to send order status notification:', pushError.message);
-            }
         }
 
         return res.status(200).json({

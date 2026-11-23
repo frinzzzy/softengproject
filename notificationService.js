@@ -64,10 +64,19 @@ const sendOrderStatusNotification = async ({ session_id, table_id, order_id, sta
             tokens: batch,
             notification: message,
             data: {
+                type: 'order_status',
                 order_id: String(order_id ?? ''),
                 session_id: String(session_id ?? ''),
                 table_id: String(table_id ?? ''),
                 status: normalizedStatus
+            },
+            android: {
+                priority: 'high',
+                notification: {
+                    channelId: 'balai_silayan_orders_v2',
+                    icon: 'ic_stat_balai',
+                    sound: 'default'
+                }
             }
         });
 
@@ -265,6 +274,7 @@ const sendCustomerOrderPlacedNotification = async ({
             tokens: batch,
             notification: message,
             data: {
+                type: isAdditional ? 'additional_order' : 'new_order',
                 order_id: String(order_id ?? ''),
                 session_id: String(session_id ?? ''),
                 table_id: String(table_id ?? ''),
