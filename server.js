@@ -15,10 +15,15 @@ if (!JWT_SECRET) {
 const authRoutes = require('./auth');
 const assistanceRoutes = require('./assistance');
 const adminStaffRoutes = require('./adminStaff');
-const { googleSignIn, attachCustomerSession } = require('./customerAuth');
+const {
+  googleSignIn,
+  customerIdentitySignIn,
+  attachCustomerSession
+} = require('./customerAuth');
 const { authenticateToken, authorizeRoles } = require('./authMiddleware');
 const { initStaffAuthSchema } = require('./staffAuthSchema');
 const { initOrderChecklistSchema } = require('./orderChecklistSchema');
+const { initCustomerSessionSchema } = require('./customerSessionSchema');
 
 const eventHub = require('./eventHub');
 const notificationService = require('./notificationService');
@@ -313,8 +318,27 @@ app.get('/t/:token', async (req, res) => {
   }
 });
 
+/// Kunin ang verified Google customer mula sa identity token ng login-first
+/// flow. Humuhugot lang ito ng customer_id — hindi nito pinapayagan ang client
+/// na magpanggap na ibang customer.
+const verifyCustomerIdentity = (authorizationHeader) => {
+  const token = getBearerToken(authorizationHeader);
+  if (!token) return null;
+
+  try {
+    const claims = jwt.verify(token, JWT_SECRET);
+    if (claims?.purpose !== 'customer_identity') return null;
+    const customerId = Number(claims.customer_id);
+    if (!Number.isSafeInteger(customerId) || customerId <= 0) return null;
+    return { customerId, email: claims.email || null };
+  } catch (_) {
+    return null;
+  }
+};
+
 app.get('/api/session/scan/:qr_token', async (req, res) => {
   const { qr_token } = req.params;
+  const identity = verifyCustomerIdentity(req.headers['authorization']);
 
   try {
     let tableId;
@@ -340,6 +364,15 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
     }
 
     const foundTable = tableResult.rows[0];
+
+    if (!identity) {
+      return res.status(401).json({
+        success: false,
+        code: 'GOOGLE_SIGN_IN_REQUIRED',
+        error: 'GOOGLE_SIGN_IN_REQUIRED',
+        message: 'Sign in with Google before scanning a table QR.'
+      });
+    }
 
     const sessionResult = await pool.query(
       "SELECT * FROM table_sessions WHERE table_id = $1 AND UPPER(session_status) IN ('ACTIVE', 'OPEN') ORDER BY id DESC LIMIT 1",
@@ -397,16 +430,40 @@ app.get('/api/session/scan/:qr_token', async (req, res) => {
       }
     }
 
+    // I-link ang Google customer sa table session. COALESCE ang ginagamit para
+    // hindi mabura ang orihinal na nag-scan kung may ibang customer na sumcan
+    // sa parehong mesa; ang bawat order ay may sariling customer_id mula sa
+    // session token ng sariling telepono.
+    await pool.query(
+      `UPDATE table_sessions
+          SET customer_id = COALESCE(customer_id, $2::int),
+              last_active_at = CURRENT_TIMESTAMP
+        WHERE id = $1::int`,
+      [session.id, identity.customerId]
+    );
+
+    const customerRes = await pool.query(
+      `SELECT ca.id, ca.email,
+              NULLIF(TRIM(COALESCE(cp.given_name, '') || ' ' || COALESCE(cp.family_name, '')), '') AS customer_name
+         FROM customer_accounts ca
+         LEFT JOIN customer_profiles cp ON cp.customer_id = ca.id
+        WHERE ca.id = $1::int`,
+      [identity.customerId]
+    );
+
     return res.status(200).json({
       success: true,
       table_id: foundTable.id,
       table_number: foundTable.table_number,
       session_id: session.id,
+      customer: customerRes.rows[0] || null,
       session_token: jwt.sign(
         {
           purpose: 'table_session',
           session_id: session.id,
-          table_id: foundTable.id
+          table_id: foundTable.id,
+          channel: 'DINE_IN',
+          customer_id: identity.customerId
         },
         JWT_SECRET,
         { expiresIn: '12h' }
@@ -441,6 +498,7 @@ app.post('/api/v1/dev/force-active-session', async (req, res) => {
 });
 
 app.post('/api/v1/customer/auth/google', googleSignIn);
+app.post('/api/v1/customer/auth/google/identity', customerIdentitySignIn);
 app.post('/api/v1/orders', attachCustomerSession, createOrder);
 app.get('/api/v1/orders/unfinished', getUnfinishedOrders);
 app.get('/api/v1/orders/:id', getOrderById);
@@ -860,7 +918,8 @@ app.get('/api/v1/customer/menu', async (req, res) => {
 Promise.all([
   initBillState(),
   initStaffAuthSchema(),
-  initOrderChecklistSchema()
+  initOrderChecklistSchema(),
+  initCustomerSessionSchema()
 ])
   .then(() => {
     server.listen(PORT, '0.0.0.0', () => {

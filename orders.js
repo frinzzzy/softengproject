@@ -49,6 +49,26 @@ const resolveServiceIdentity = async (
             return buildServiceIdentity(rows[0] || {}, fulfillmentType);
         }
 
+        // Kapag partikular na order ang tinutukoy, iyon lang ang ituturing —
+        // para hindi maging "Takeout" ang dine-in ticket sa iisang session
+        // dahil lang may takeout order ang katabi nito.
+        if (orderId != null) {
+            const { rows } = await queryFn(
+                `SELECT
+                     UPPER(COALESCE(o.fulfillment_type, 'DINE_IN')) = 'TAKEOUT'
+                     OR COALESCE(t.is_virtual, FALSE) AS is_takeout,
+                     ca.email AS customer_email,
+                     NULLIF(TRIM(COALESCE(cp.given_name, '') || ' ' || COALESCE(cp.family_name, '')), '') AS customer_name
+                   FROM orders o
+                   LEFT JOIN tables t ON t.id = o.table_id
+                   LEFT JOIN customer_accounts ca ON o.customer_id = ca.id
+                   LEFT JOIN customer_profiles cp ON cp.customer_id = ca.id
+                  WHERE o.id = $1::int`,
+                [Number(orderId)]
+            );
+            return buildServiceIdentity(rows[0] || {}, fulfillmentType);
+        }
+
         const conditions = [];
         const values = [];
         if (sessionId != null) {
@@ -104,22 +124,28 @@ const createOrder = async (req, res) => {
         notes
     } = req.body || {};
 
-    // Kapag verified online (Google) session, server-side ang table/session/
-    // customer — hindi puwedeng i-spoof ng client ang table_id.
+    // Kapag verified Google session, server-side ang table/session/customer —
+    // hindi puwedeng i-spoof ng client ang table_id o identity.
     const onlineSession = req.customerSession || null;
 
-    const tableId = onlineSession ? onlineSession.tableId : Number(table_id);
-    const sessionId = onlineSession
-        ? onlineSession.sessionId
-        : (session_id == null ? null : Number(session_id));
+    // Login-first flow: bawat order ay kailangang may verified Google customer.
+    if (!onlineSession || !Number.isSafeInteger(Number(onlineSession.customerId)) ||
+        Number(onlineSession.customerId) <= 0) {
+        return res.status(401).json({
+            success: false,
+            code: 'AUTH_REQUIRED',
+            message: 'Google Sign-In is required before placing an order.'
+        });
+    }
+
+    const tableId = onlineSession.tableId;
+    const sessionId = onlineSession.sessionId;
     const parentOrderId = parent_order_id == null ? null : Number(parent_order_id);
     const isAdditional = is_additional_order === true;
-    const customerId = onlineSession ? onlineSession.customerId : null;
-    // Online (Google) session -> automatically TAKEOUT (virtual table).
-    // Dine-in (QR) session -> default DINE_IN; the customer may override the
-    // fulfillment via checkout (Take Out / To-Go) while the physical
-    // table/session (hal. Table 5) is kept.
-    const fulfillmentType = onlineSession
+    const customerId = Number(onlineSession.customerId);
+    // Virtual table (legacy takeout) -> forced TAKEOUT.
+    // Physical table (QR scan) -> ang checkout ang pumili ng DINE_IN / TAKEOUT.
+    const fulfillmentType = onlineSession.fulfillmentType === 'TAKEOUT'
         ? 'TAKEOUT'
         : (req.body && req.body.fulfillment_type === 'TAKEOUT'
             ? 'TAKEOUT'
@@ -270,10 +296,10 @@ const createOrder = async (req, res) => {
         );
     });
 
-    // Gmail order ticket — ipadala ang customer (Google sign-in takeout) ang order
-    // ticket sa kanilang verified email address. Best-effort lang; hindi bumabagsak
-    // ang order creation kung mag-fail ang email.
-    if (customerId) {
+    // Gmail order ticket — para sa Google sign-in takeout lang; hindi ito
+    // ipinapadala sa dine-in orders na may Google identity. Best-effort lang;
+    // hindi bumabagsak ang order creation kung mag-fail ang email.
+    if (customerId && fulfillmentType === 'TAKEOUT') {
         emailService
             .sendOrderTicketEmail({
                 customerId,

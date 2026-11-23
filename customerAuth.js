@@ -246,9 +246,95 @@ const googleSignIn = async (req, res) => {
     }
 };
 
-/// Best-effort middleware: kapag valid ang customer session token at virtual
-/// table ito, i-override ang table/session/customer sa order creation.
-const attachCustomerSession = (req, res, next) => {
+/// POST /api/v1/customer/auth/google/identity
+/// Bagong login-first flow: i-verify ang Google account at mag-issue ng
+/// customer identity token. Hindi ito gumagawa ng virtual table/session —
+/// ang physical table session ay makuha lang sa QR scan.
+const customerIdentitySignIn = async (req, res) => {
+    const idToken = req.body?.id_token || req.body?.idToken;
+
+    if (!idToken) {
+        return res.status(400).json({
+            success: false,
+            message: 'Google ID token is required.'
+        });
+    }
+
+    if (googleAudiences.length === 0) {
+        console.error('[Google Auth] GOOGLE_CLIENT_IDS/GOOGLE_CLIENT_ID is not set.');
+        return res.status(503).json({
+            success: false,
+            message: 'Google Sign-In is not configured on the server yet.'
+        });
+    }
+
+    try {
+        const payload = await verifyGoogleIdToken(idToken);
+        if (!payload?.sub) {
+            return res.status(401).json({
+                success: false,
+                message: 'Google account could not be verified.'
+            });
+        }
+
+        if (payload.email_verified === false) {
+            return res.status(401).json({
+                success: false,
+                message: 'Please verify your Google email first.'
+            });
+        }
+
+        const client = await pool.connect();
+        let customer;
+        try {
+            await client.query('BEGIN');
+            customer = await upsertCustomer(client, payload);
+            await client.query('COMMIT');
+        } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+        } finally {
+            client.release();
+        }
+
+        const identityToken = jwt.sign(
+            {
+                purpose: 'customer_identity',
+                customer_id: customer.id,
+                email: customer.email || null
+            },
+            JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+
+        return res.status(200).json({
+            success: true,
+            customer,
+            identity_token: identityToken,
+            message: 'Google identity verified.'
+        });
+    } catch (error) {
+        console.error('[Google Auth] Identity sign-in failed:', error.message);
+
+        const isVerificationError = /token|audience|issuer|expired|signature/i.test(
+            error.message || ''
+        );
+        return res.status(isVerificationError ? 401 : 500).json({
+            success: false,
+            message: isVerificationError
+                ? 'Invalid or expired Google token. Please sign in again.'
+                : 'Unable to sign in with Google right now.'
+        });
+    }
+};
+
+/// Middleware para sa customer orders.
+/// - Virtual table (legacy takeout): i-override ang table/session/customer at
+///   forced TAKEOUT — pinapanatili ang lumang paggawi.
+/// - Physical table (bagong QR flow): kung may customer_id ang session token,
+///   i-attach ang customer identity pero hayaang ang checkout ang magpili ng
+///   DINE_IN o TAKEOUT.
+const attachCustomerSession = async (req, res, next) => {
     const token = getBearerToken(req.headers['authorization']);
     if (!token) return next();
 
@@ -267,48 +353,79 @@ const attachCustomerSession = (req, res, next) => {
         return next();
     }
 
-    pool.query(
-        `SELECT t.is_virtual, v.customer_id
-           FROM tables t
-           LEFT JOIN virtual_table_owners v ON v.table_id = t.id
-          WHERE t.id = $1::int`,
-        [Number(claims.table_id)]
-    )
-        .then(async (tableResult) => {
-            if (tableResult.rows.length === 0) return next();
-            const table = tableResult.rows[0];
-            if (!table.is_virtual || !table.customer_id) return next();
+    const tableId = Number(claims.table_id);
+    const sessionId = Number(claims.session_id);
+    const tokenCustomerId = Number(claims.customer_id);
+    const hasTokenCustomer =
+        Number.isSafeInteger(tokenCustomerId) && tokenCustomerId > 0;
 
-            const sessionResult = await pool.query(
-                `SELECT id
-                   FROM table_sessions
-                  WHERE id = $1::int
-                    AND table_id = $2::int
-                    AND UPPER(session_status) IN ('ACTIVE', 'OPEN')`,
-                [Number(claims.session_id), Number(claims.table_id)]
-            );
+    try {
+        const tableResult = await pool.query(
+            `SELECT t.is_virtual, v.customer_id
+               FROM tables t
+               LEFT JOIN virtual_table_owners v ON v.table_id = t.id
+              WHERE t.id = $1::int`,
+            [tableId]
+        );
+        if (tableResult.rows.length === 0) return next();
 
-            if (sessionResult.rows.length === 0) {
-                return res.status(409).json({
-                    success: false,
-                    error: 'SESSION_CLOSED',
-                    message: 'This takeout session is already closed. Please sign in again.'
-                });
+        const table = tableResult.rows[0];
+
+        // Physical table na walang Google identity: hayaang tanggihan ito ng
+        // createOrder na may AUTH_REQUIRED (hindi SESSION_CLOSED).
+        if (!table.is_virtual && !hasTokenCustomer) return next();
+
+        const sessionResult = await pool.query(
+            `SELECT id
+               FROM table_sessions
+              WHERE id = $1::int
+                AND table_id = $2::int
+                AND UPPER(session_status) IN ('ACTIVE', 'OPEN')`,
+            [sessionId, tableId]
+        );
+
+        if (sessionResult.rows.length === 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'SESSION_CLOSED',
+                message: table.is_virtual
+                    ? 'This takeout session is already closed. Please sign in again.'
+                    : 'This table session is already closed. Please scan the table QR again.'
+            });
+        }
+
+        if (table.is_virtual) {
+            const virtualCustomerId = hasTokenCustomer
+                ? tokenCustomerId
+                : Number(table.customer_id);
+            if (!Number.isSafeInteger(virtualCustomerId) || virtualCustomerId <= 0) {
+                return next();
             }
-
             req.customerSession = {
-                customerId: Number(table.customer_id),
-                tableId: Number(claims.table_id),
-                sessionId: Number(claims.session_id),
+                customerId: virtualCustomerId,
+                tableId,
+                sessionId,
+                channel: 'TAKEOUT',
                 fulfillmentType: 'TAKEOUT'
             };
             return next();
-        })
-        .catch(() => next());
+        }
+
+        req.customerSession = {
+            customerId: tokenCustomerId,
+            tableId,
+            sessionId,
+            channel: String(claims.channel || 'DINE_IN').toUpperCase()
+        };
+        return next();
+    } catch (_) {
+        return next();
+    }
 };
 
 module.exports = {
     googleSignIn,
+    customerIdentitySignIn,
     attachCustomerSession,
     verifyGoogleIdToken
 };

@@ -71,12 +71,15 @@ CREATE TABLE table_sessions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     closed_at TIMESTAMP,
     last_active_at TIMESTAMP,
-    bill_requested_at TIMESTAMP
+    bill_requested_at TIMESTAMP,
+    customer_id INT
 );
 
 -- Backwards-compatible migrations for existing deployments
 ALTER TABLE table_sessions ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP;
 ALTER TABLE table_sessions ADD COLUMN IF NOT EXISTS bill_requested_at TIMESTAMP;
+ALTER TABLE table_sessions ADD COLUMN IF NOT EXISTS customer_id INT;
+CREATE INDEX IF NOT EXISTS idx_table_sessions_customer_id ON table_sessions(customer_id);
 
 CREATE TABLE IF NOT EXISTS customer_fcm_tokens (
     id BIGSERIAL PRIMARY KEY,
