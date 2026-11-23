@@ -13,6 +13,86 @@ const logApiResponse = (endpoint, details) => {
     }
 };
 
+/// Admin-facing labels para sa takeout: gamitin ang Google customer name/email,
+/// hindi ang virtual table number (900000 + customer_id, hal. 9090990).
+const buildServiceIdentity = (row = {}, fallbackFulfillmentType = null) => {
+    const isTakeout =
+        Boolean(row.is_takeout) ||
+        String(fallbackFulfillmentType || '').toUpperCase() === 'TAKEOUT';
+    const customerName = String(row.customer_name || '').trim();
+    const customerEmail = String(row.customer_email || '').trim();
+    const who = customerName && customerEmail
+        ? `${customerName} (${customerEmail})`
+        : (customerName || customerEmail);
+    return {
+        isTakeout,
+        customerName,
+        customerEmail,
+        label: isTakeout ? (who ? `Takeout — ${who}` : 'Takeout') : null
+    };
+};
+
+const resolveServiceIdentity = async (
+    queryFn,
+    { sessionId = null, orderId = null, customerId = null, tableId = null, fulfillmentType = null } = {}
+) => {
+    try {
+        if (customerId != null && sessionId == null && orderId == null) {
+            const { rows } = await queryFn(
+                `SELECT ca.email AS customer_email,
+                        NULLIF(TRIM(COALESCE(cp.given_name, '') || ' ' || COALESCE(cp.family_name, '')), '') AS customer_name
+                   FROM customer_accounts ca
+                   LEFT JOIN customer_profiles cp ON cp.customer_id = ca.id
+                  WHERE ca.id = $1::int`,
+                [Number(customerId)]
+            );
+            return buildServiceIdentity(rows[0] || {}, fulfillmentType);
+        }
+
+        const conditions = [];
+        const values = [];
+        if (sessionId != null) {
+            values.push(Number(sessionId));
+            conditions.push(`o.session_id = $${values.length}::int`);
+        }
+        if (orderId != null) {
+            values.push(Number(orderId));
+            conditions.push(`o.id = $${values.length}::int`);
+        }
+        if (customerId != null) {
+            values.push(Number(customerId));
+            conditions.push(`o.customer_id = $${values.length}::int`);
+        }
+        if (tableId != null) {
+            values.push(Number(tableId));
+            conditions.push(`t.id = $${values.length}::int`);
+        }
+        if (conditions.length === 0) {
+            return buildServiceIdentity({}, fulfillmentType);
+        }
+
+        const { rows } = await queryFn(
+            `SELECT
+                 BOOL_OR(
+                     UPPER(COALESCE(o.fulfillment_type, 'DINE_IN')) = 'TAKEOUT'
+                     OR COALESCE(t.is_virtual, FALSE)
+                 ) AS is_takeout,
+                 MAX(ca.email) AS customer_email,
+                 MAX(NULLIF(TRIM(COALESCE(cp.given_name, '') || ' ' || COALESCE(cp.family_name, '')), '')) AS customer_name
+               FROM orders o
+               LEFT JOIN tables t ON t.id = o.table_id
+               LEFT JOIN customer_accounts ca ON o.customer_id = ca.id
+               LEFT JOIN customer_profiles cp ON cp.customer_id = ca.id
+              WHERE ${conditions.join(' OR ')}`,
+            values
+        );
+        return buildServiceIdentity(rows[0] || {}, fulfillmentType);
+    } catch (error) {
+        console.error('[ServiceIdentity] Failed to resolve admin label:', error.message);
+        return buildServiceIdentity({}, fulfillmentType);
+    }
+};
+
 const createOrder = async (req, res) => {
     const {
         table_id,
@@ -144,12 +224,20 @@ const createOrder = async (req, res) => {
     const notePreview = result.order && result.order.notes
         ? ` • NOTE: ${String(result.order.notes).replace(/\s+/g, ' ').slice(0, 60)}`
         : '';
+    const serviceIdentity = await resolveServiceIdentity(pool, {
+        orderId: result.order.id,
+        sessionId: result.order.session_id,
+        customerId,
+        fulfillmentType
+    });
+    const adminServiceLabel = serviceIdentity.label ||
+        `Table #${result.order.table_id}`;
     notificationService.sendStaffNotification({
-        title: fulfillmentType === 'TAKEOUT'
-            ? `New Takeout Order #${result.order.id}`
+        title: serviceIdentity.isTakeout
+            ? `New Takeout Order — ${adminServiceLabel}`
             : (isAdditional
-                ? `Additional Order — Table #${result.order.table_id}`
-                : `New Order — Table #${result.order.table_id}`),
+                ? `Additional Order — ${adminServiceLabel}`
+                : `New Order — ${adminServiceLabel}`),
         body: `Order #${result.order.id}${itemCount > 0 ? ` • ${itemCount} item(s)` : ''}${totalAmount > 0 ? ` • ₱${totalAmount.toFixed(2)}` : ''}${notePreview}`,
         data: {
             type: isAdditional ? 'additional_order' : 'new_order',
@@ -157,6 +245,8 @@ const createOrder = async (req, res) => {
             session_id: result.order.session_id,
             table_id: result.order.table_id,
             fulfillment_type: fulfillmentType,
+            customer_name: serviceIdentity.customerName,
+            customer_email: serviceIdentity.customerEmail,
             is_additional: isAdditional ? '1' : '0'
         }
     }).catch((pushError) => {
@@ -1560,7 +1650,13 @@ const requestBill = async (req, res) => {
 
         const grandTotal = parseFloat(summary.grand_total);
         const totalOrders = parseInt(summary.total_orders, 10);
+        const serviceIdentity = await resolveServiceIdentity(client, {
+            sessionId: activeSession.id,
+            tableId
+        });
         await client.query('COMMIT');
+
+        const billServiceLabel = serviceIdentity.label || `Table #${tableId}`;
 
         if (!alreadyRequested && eventHub) {
             try {
@@ -1572,7 +1668,10 @@ const requestBill = async (req, res) => {
                     total_orders: totalOrders,
                     grand_total: grandTotal,
                     requested_at: billRequestedAt,
-                    message: `Table #${tableId} requested bill out. Total: ₱${grandTotal.toFixed(2)}`
+                    fulfillment_type: serviceIdentity.isTakeout ? 'TAKEOUT' : 'DINE_IN',
+                    customer_name: serviceIdentity.customerName,
+                    customer_email: serviceIdentity.customerEmail,
+                    message: `${billServiceLabel} requested bill out. Total: ₱${grandTotal.toFixed(2)}`
                 });
             } catch (emitError) {
                 console.error('Bill request event emit error:', emitError.message);
@@ -1581,12 +1680,17 @@ const requestBill = async (req, res) => {
 
         if (!alreadyRequested) {
             notificationService.sendStaffNotification({
-                title: `Bill Requested — Table #${tableId}`,
-                body: `Grand total ₱${grandTotal.toFixed(2)} • ${totalOrders} order(s)`,
+                title: `Bill Requested — ${billServiceLabel}`,
+                body: serviceIdentity.isTakeout
+                    ? `Takeout order • Grand total ₱${grandTotal.toFixed(2)} • ${totalOrders} order(s)`
+                    : `Grand total ₱${grandTotal.toFixed(2)} • ${totalOrders} order(s)`,
                 data: {
                     type: 'bill_requested',
                     session_id: activeSession.id,
                     table_id: tableId,
+                    fulfillment_type: serviceIdentity.isTakeout ? 'TAKEOUT' : 'DINE_IN',
+                    customer_name: serviceIdentity.customerName,
+                    customer_email: serviceIdentity.customerEmail,
                     grand_total: grandTotal.toFixed(2),
                     scope: 'session'
                 }
@@ -1611,8 +1715,8 @@ const requestBill = async (req, res) => {
         return res.status(200).json({
             success: true,
             message: alreadyRequested
-                ? `Bill has already been requested for Table #${tableId}.`
-                : `Bill request sent successfully for Table #${tableId}.`,
+                ? `Bill has already been requested for ${billServiceLabel}.`
+                : `Bill request sent successfully for ${billServiceLabel}.`,
             data: responseData
         });
 
@@ -1716,6 +1820,12 @@ const requestOrderBill = async (req, res) => {
         const ticketRow = updated.rows.find((row) => Number(row.id) === ticketRootId) || updated.rows[0];
         const billRequestedAt = ticketRow ? ticketRow.bill_requested_at : null;
         const alreadyRequested = order.bill_requested_at != null;
+        const serviceIdentity = await resolveServiceIdentity(client, {
+            orderId: ticketRootId,
+            sessionId: order.session_id,
+            tableId: order.table_id
+        });
+        const billServiceLabel = serviceIdentity.label || `Table #${order.table_id}`;
 
         const totalsRes = await client.query(
             `SELECT COALESCE(SUM(total_amount), 0) AS ticket_total
@@ -1752,7 +1862,10 @@ const requestOrderBill = async (req, res) => {
                     total_orders: updated.rows.length,
                     grand_total: ticketTotal,
                     requested_at: billRequestedAt,
-                    message: `Ticket #${ticketRootId} requested bill out. Total: ₱${ticketTotal.toFixed(2)}`
+                    fulfillment_type: serviceIdentity.isTakeout ? 'TAKEOUT' : 'DINE_IN',
+                    customer_name: serviceIdentity.customerName,
+                    customer_email: serviceIdentity.customerEmail,
+                    message: `${billServiceLabel} requested bill out. Total: ₱${ticketTotal.toFixed(2)}`
                 });
             } catch (emitError) {
                 console.error('Ticket bill request event emit error:', emitError.message);
@@ -1761,13 +1874,18 @@ const requestOrderBill = async (req, res) => {
 
         if (!alreadyRequested) {
             notificationService.sendStaffNotification({
-                title: `Bill Requested — Table #${order.table_id}`,
-                body: `Ticket #${ticketRootId} • ₱${ticketTotal.toFixed(2)}`,
+                title: `Bill Requested — ${billServiceLabel}`,
+                body: serviceIdentity.isTakeout
+                    ? `Takeout order • ₱${ticketTotal.toFixed(2)}`
+                    : `Ticket #${ticketRootId} • ₱${ticketTotal.toFixed(2)}`,
                 data: {
                     type: 'bill_requested',
                     order_id: ticketRootId,
                     session_id: order.session_id,
                     table_id: order.table_id,
+                    fulfillment_type: serviceIdentity.isTakeout ? 'TAKEOUT' : 'DINE_IN',
+                    customer_name: serviceIdentity.customerName,
+                    customer_email: serviceIdentity.customerEmail,
                     grand_total: ticketTotal.toFixed(2),
                     scope: 'ticket'
                 }
